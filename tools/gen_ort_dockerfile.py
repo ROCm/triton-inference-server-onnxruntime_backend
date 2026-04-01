@@ -136,6 +136,7 @@ def dockerfile_for_linux(output_file):
 # Ensure apt-get won't prompt for selecting options
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
+ENV CMAKE_POLICY_VERSION_MINIMUM=3.5
 
 # The Onnx Runtime dockerfile is the collection of steps in
 # https://github.com/microsoft/onnxruntime/tree/master/dockerfiles
@@ -166,7 +167,7 @@ RUN dnf install -y \\
         wget \\
         zip
 
-RUN pipx install cmake==4.0.3 --force
+RUN pipx install cmake==3.31.8 --force
 
 RUN pip3 install patchelf==0.17.2 numpy>=2.0.0
 """
@@ -205,7 +206,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \\
         zip
 
 RUN pip3 install \\
-       cmake==4.0.3 \\
+       cmake==3.31.8 \\
        numpy \\
        packaging \\
        patchelf==0.17.2 \\
