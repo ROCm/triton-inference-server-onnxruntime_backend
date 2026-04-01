@@ -167,7 +167,7 @@ RUN dnf install -y \\
         wget \\
         zip
 
-RUN pipx install cmake==3.31.8 --force
+RUN pipx install cmake==3.31.10 --force
 
 RUN pip3 install patchelf==0.17.2 numpy>=2.0.0
 """
@@ -206,7 +206,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \\
         zip
 
 RUN pip3 install \\
-       cmake==3.31.8 \\
+       cmake==3.31.10 \\
        numpy \\
        packaging \\
        patchelf==0.17.2 \\
