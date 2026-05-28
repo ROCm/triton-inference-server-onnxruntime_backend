@@ -839,6 +839,35 @@ ModelState::LoadModel(
                     keys.push_back("migraphx_exhaustive_tune");
                     values.push_back(
                         value_string == "true" ? "1" : "0");
+                  } else if (param_key == "migraphx_bf16_enable") {
+                    RETURN_IF_ERROR(params.MemberAsString(
+                        param_key.c_str(), &value_string));
+                    bool bf16_enable;
+                    RETURN_IF_ERROR(ParseBoolValue(value_string, &bf16_enable));
+                    keys.push_back("migraphx_bf16_enable");
+                    values.push_back(bf16_enable ? "1" : "0");
+                  } else if (param_key == "migraphx_fp8_enable") {
+                    RETURN_IF_ERROR(params.MemberAsString(
+                        param_key.c_str(), &value_string));
+                    bool fp8_enable;
+                    RETURN_IF_ERROR(ParseBoolValue(value_string, &fp8_enable));
+                    keys.push_back("migraphx_fp8_enable");
+                    values.push_back(fp8_enable ? "1" : "0");
+                  } else if (param_key == "migraphx_int8_enable") {
+                    RETURN_IF_ERROR(params.MemberAsString(
+                        param_key.c_str(), &value_string));
+                    bool int8_enable;
+                    RETURN_IF_ERROR(ParseBoolValue(value_string, &int8_enable));
+                    keys.push_back("migraphx_int8_enable");
+                    values.push_back(int8_enable ? "1" : "0");
+                  } else if (param_key == "migraphx_mem_limit") {
+                    RETURN_IF_ERROR(params.MemberAsString(
+                        param_key.c_str(), &value_string));
+                    size_t mem_limit;
+                    RETURN_IF_ERROR(ParseUnsignedLongLongValue(
+                        value_string, &mem_limit));
+                    keys.push_back("migraphx_mem_limit");
+                    values.push_back(std::to_string(mem_limit));
                   } else {
                     return TRITONSERVER_ErrorNew(
                         TRITONSERVER_ERROR_INVALID_ARG,
