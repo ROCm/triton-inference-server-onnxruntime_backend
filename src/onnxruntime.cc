@@ -769,7 +769,8 @@ ModelState::LoadModel(
 #ifdef TRITON_ENABLE_ONNXRUNTIME_MIGRAPHX
             if (name == kMIGraphXExecutionAccelerator) {
               // Build MIGraphX provider options as string key-value pairs
-              // so the stream pointer can be passed via the ProviderOptions map.
+              // so the stream pointer can be passed via the ProviderOptions
+              // map.
               std::vector<std::string> keys, values;
               std::string int8_calibration_table_name;
               std::string model_cache_dir;
@@ -818,8 +819,8 @@ ModelState::LoadModel(
                         value_string, &use_native_calibration_table));
                     keys.push_back(
                         "migraphx_int8_use_native_calibration_table");
-                    values.push_back(std::to_string(
-                        use_native_calibration_table));
+                    values.push_back(
+                        std::to_string(use_native_calibration_table));
                   } else if (param_key == "migraphx_model_cache_dir") {
                     RETURN_IF_ERROR(params.MemberAsString(
                         param_key.c_str(), &model_cache_dir));
@@ -837,8 +838,7 @@ ModelState::LoadModel(
                     RETURN_IF_ERROR(params.MemberAsString(
                         param_key.c_str(), &value_string));
                     keys.push_back("migraphx_exhaustive_tune");
-                    values.push_back(
-                        value_string == "true" ? "1" : "0");
+                    values.push_back(value_string == "true" ? "1" : "0");
                   } else if (param_key == "migraphx_bf16_enable") {
                     RETURN_IF_ERROR(params.MemberAsString(
                         param_key.c_str(), &value_string));
@@ -864,8 +864,8 @@ ModelState::LoadModel(
                     RETURN_IF_ERROR(params.MemberAsString(
                         param_key.c_str(), &value_string));
                     size_t mem_limit;
-                    RETURN_IF_ERROR(ParseUnsignedLongLongValue(
-                        value_string, &mem_limit));
+                    RETURN_IF_ERROR(
+                        ParseUnsignedLongLongValue(value_string, &mem_limit));
                     keys.push_back("migraphx_mem_limit");
                     values.push_back(std::to_string(mem_limit));
                   } else {
@@ -882,8 +882,8 @@ ModelState::LoadModel(
 
               if (stream != nullptr) {
                 keys.push_back("user_compute_stream");
-                values.push_back(std::to_string(
-                    reinterpret_cast<size_t>(stream)));
+                values.push_back(
+                    std::to_string(reinterpret_cast<size_t>(stream)));
               }
 
               std::vector<const char*> c_keys, c_values;
@@ -893,8 +893,8 @@ ModelState::LoadModel(
               }
               RETURN_IF_ORT_ERROR(
                   ort_api->SessionOptionsAppendExecutionProvider(
-                      soptions, "MIGraphX",
-                      c_keys.data(), c_values.data(), keys.size()));
+                      soptions, "MIGraphX", c_keys.data(), c_values.data(),
+                      keys.size()));
               LOG_MESSAGE(
                   TRITONSERVER_LOG_VERBOSE,
                   (std::string("MIGraphX Execution Accelerator is set for '") +
@@ -1086,8 +1086,10 @@ ModelState::LoadModel(
       if (model_config_.Find("parameters", &params)) {
         int miopen_conv_exhaustive_search = 0;
         RETURN_IF_ERROR(TryParseModelStringParameter(
-            params, "miopen_conv_exhaustive_search", &miopen_conv_exhaustive_search, 0));
-        rocm_options.miopen_conv_exhaustive_search = miopen_conv_exhaustive_search;
+            params, "miopen_conv_exhaustive_search",
+            &miopen_conv_exhaustive_search, 0));
+        rocm_options.miopen_conv_exhaustive_search =
+            miopen_conv_exhaustive_search;
 
         RETURN_IF_ERROR(TryParseModelStringParameter(
             params, "gpu_mem_limit", &rocm_options.gpu_mem_limit,
@@ -1102,8 +1104,8 @@ ModelState::LoadModel(
             &rocm_options.do_copy_in_default_stream, true));
 
         RETURN_IF_ERROR(TryParseModelStringParameter(
-            params, "tunable_op_enable",
-            &rocm_options.tunable_op_enable, true));
+            params, "tunable_op_enable", &rocm_options.tunable_op_enable,
+            true));
 
         RETURN_IF_ERROR(TryParseModelStringParameter(
             params, "tunable_op_tuning_enable",
@@ -1111,8 +1113,10 @@ ModelState::LoadModel(
 
         int tunable_op_max_tuning_ms = 0;
         RETURN_IF_ERROR(TryParseModelStringParameter(
-            params, "tunable_op_max_tuning_duration_ms", &tunable_op_max_tuning_ms, 0));
-        rocm_options.tunable_op_max_tuning_duration_ms = tunable_op_max_tuning_ms;
+            params, "tunable_op_max_tuning_duration_ms",
+            &tunable_op_max_tuning_ms, 0));
+        rocm_options.tunable_op_max_tuning_duration_ms =
+            tunable_op_max_tuning_ms;
       }
     }
 
@@ -1595,7 +1599,7 @@ ModelInstanceState::ModelInstanceState(
         "Cuda", OrtAllocatorType::OrtArenaAllocator, DeviceId(),
         OrtMemTypeDefault, &cuda_allocator_info_));
   }
-#endif //TRITON_ENABLE_GPU
+#endif  // TRITON_ENABLE_GPU
 
 #ifdef TRITON_ENABLE_ROCM
   if (Kind() == TRITONSERVER_INSTANCEGROUPKIND_GPU) {
@@ -1603,7 +1607,7 @@ ModelInstanceState::ModelInstanceState(
         "Hip", OrtAllocatorType::OrtArenaAllocator, DeviceId(),
         OrtMemTypeDefault, &cuda_allocator_info_));
   }
-#endif //TRITON_ENABLE_ROCM
+#endif  // TRITON_ENABLE_ROCM
   THROW_IF_BACKEND_INSTANCE_ORT_ERROR(
       ort_api->AllocatorGetInfo(default_allocator_, &cpu_allocator_info_));
 
@@ -2359,7 +2363,8 @@ ModelInstanceState::ProcessRequests(
   // Wait for any in-flight input tensor copies to complete.
 #ifdef TRITON_ENABLE_ROCM
   if (cuda_copy) {
-    static_cast<void>(hipStreamSynchronize(static_cast<hipStream_t>(CudaStream())));
+    static_cast<void>(
+        hipStreamSynchronize(static_cast<hipStream_t>(CudaStream())));
   }
 #endif
 
@@ -2738,7 +2743,8 @@ ModelInstanceState::SetStringInputTensor(
 #ifdef TRITON_ENABLE_ROCM
   // Synchronize to ensure the buffer is ready to be modified
   if (*cuda_copy) {
-    static_cast<void>(hipStreamSynchronize(static_cast<hipStream_t>(CudaStream())));
+    static_cast<void>(
+        hipStreamSynchronize(static_cast<hipStream_t>(CudaStream())));
 
     *cuda_copy = false;
   }
