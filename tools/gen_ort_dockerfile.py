@@ -318,7 +318,7 @@ RUN rm -rf onnxruntime && \\
             FLAGS.onnxruntime_repo,
             FLAGS.onnxruntime_branch,
         )
-    ## TEMPORARY: Using the tensorrt-8.0 branch until ORT 1.9 release to enable ORT backend with TRT 8.0 support.
+    # TEMPORARY: Using the tensorrt-8.0 branch until ORT 1.9 release to enable ORT backend with TRT 8.0 support.
     # For ORT versions 1.8.0 and below the behavior will remain same. For ORT version 1.8.1 we will
     # use tensorrt-8.0 branch instead of using rel-1.8.1
     # From ORT 1.9 onwards we will switch back to using rel-* branches
@@ -607,7 +607,7 @@ RUN mkdir -p /opt/onnxruntime/test && \
 def dockerfile_for_windows(output_file):
     df = dockerfile_common()
 
-    ## TEMPORARY: Using the tensorrt-8.0 branch until ORT 1.9 release to enable ORT backend with TRT 8.0 support.
+    # TEMPORARY: Using the tensorrt-8.0 branch until ORT 1.9 release to enable ORT backend with TRT 8.0 support.
     # For ORT versions 1.8.0 and below the behavior will remain same. For ORT version 1.8.1 we will
     # use tensorrt-8.0 branch instead of using rel-1.8.1
     # From ORT 1.9 onwards we will switch back to using rel-* branches
@@ -831,7 +831,10 @@ if __name__ == "__main__":
 
     # ROCm/MIGraphX arguments
     parser.add_argument(
-        "--enable-rocm", action="store_true", required=False, help="Enable ROCm GPU support"
+        "--enable-rocm",
+        action="store_true",
+        required=False,
+        help="Enable ROCm GPU support",
     )
     parser.add_argument(
         "--rocm-version", type=str, required=False, help="Version for ROCm."
