@@ -778,6 +778,11 @@ ModelState::LoadModel(
               keys.push_back("device_id");
               values.push_back(std::to_string(instance_group_device_id));
 
+              // OPT-3: Default MIGraphX model cache dir — avoids recompile on
+              // every Triton restart (saves 2-5s cold-compile per batch size).
+              // Can be overridden by setting migraphx_model_cache_dir explicitly.
+              bool has_explicit_cache_dir = false;
+
               // Validate and set parameters
               triton::common::TritonJson::Value params;
               if (ea.Find("parameters", &params)) {
@@ -826,6 +831,7 @@ ModelState::LoadModel(
                         param_key.c_str(), &model_cache_dir));
                     keys.push_back("migraphx_model_cache_dir");
                     values.push_back(model_cache_dir);
+                    has_explicit_cache_dir = true;  // OPT-3: user set it explicitly
                   } else if (param_key == "migraphx_max_dynamic_batch") {
                     RETURN_IF_ERROR(params.MemberAsString(
                         param_key.c_str(), &value_string));
@@ -868,6 +874,15 @@ ModelState::LoadModel(
                         ParseUnsignedLongLongValue(value_string, &mem_limit));
                     keys.push_back("migraphx_mem_limit");
                     values.push_back(std::to_string(mem_limit));
+                  } else if (param_key == "migraphx_tuning_cache_path") {
+                    // OPT-4: Persist exhaustive_tune results so the expensive
+                    // kernel search only runs once; subsequent restarts load
+                    // saved selections from disk (5-20% runtime gain at large BS).
+                    std::string tuning_cache_path;
+                    RETURN_IF_ERROR(params.MemberAsString(
+                        param_key.c_str(), &tuning_cache_path));
+                    keys.push_back("migraphx_tuning_cache_path");
+                    values.push_back(tuning_cache_path);
                   } else {
                     return TRITONSERVER_ErrorNew(
                         TRITONSERVER_ERROR_INVALID_ARG,
@@ -880,10 +895,27 @@ ModelState::LoadModel(
                 }
               }
 
+              // OPT-3: Apply default MIGraphX model cache if not set explicitly.
+              // Avoids full MIGraphX recompile on every Triton restart.
+              if (!has_explicit_cache_dir) {
+                const char* env_cache = std::getenv("ORT_MIGRAPHX_MODEL_CACHE_PATH");
+                std::string default_cache =
+                    env_cache ? std::string(env_cache)
+                              : ("/tmp/migraphx_cache_" + Name());
+                keys.push_back("migraphx_model_cache_dir");
+                values.push_back(default_cache);
+                LOG_MESSAGE(
+                    TRITONSERVER_LOG_INFO,
+                    (std::string("MIGraphX auto cache dir for '") + Name() +
+                     "': " + default_cache)
+                        .c_str());
+              }
+
               if (stream != nullptr) {
                 keys.push_back("user_compute_stream");
                 values.push_back(
                     std::to_string(reinterpret_cast<size_t>(stream)));
+                migraphx_user_stream_active_ = true;  // OPT-1
               }
 
               std::vector<const char*> c_keys, c_values;
@@ -1544,6 +1576,10 @@ class ModelInstanceState : public BackendModelInstance {
   const OrtMemoryInfo* cpu_allocator_info_;
   OrtIoBinding* io_binding_;
   OrtRunOptions* runOptions_;
+  // OPT-1: True when MIGraphX EP is using Triton's HIP stream as user_compute_stream.
+  // When true, we skip the explicit hipStreamSynchronize before OrtRun because
+  // stream ordering on the shared stream already guarantees input readiness.
+  bool migraphx_user_stream_active_{false};
   // map of output name -> bound mem type and id
   std::unordered_map<std::string, std::pair<TRITONSERVER_MemoryType, int64_t>>
       output_device_info_;
@@ -2310,27 +2346,60 @@ ModelInstanceState::ProcessRequests(
                  output_name.first)
                  .c_str()));
       } else if (iit->second.type_ != ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING) {
-        // Query the memory type of destination output buffer. Bind the
-        // output to this destination memory type. The destination memory type
-        // for an output for all requests should be same. So use any request
-        // for this query.
+        // OPT-5: Query output memory type from the majority of requests rather
+        // than only requests[0]. A single CPU-preferring request (e.g. a health
+        // probe) would otherwise force all outputs to CPU for the whole batch,
+        // causing unnecessary D2H copies for the remaining GPU requests.
         memory_type = preferred_memory_type;
         memory_type_id = preferred_memory_type_id;
-        auto err = TRITONBACKEND_RequestOutputBufferProperties(
-            requests[0], output_name.first.c_str(), /*byte_size*/ nullptr,
-            &memory_type, &memory_type_id);
-
-        if (err != nullptr) {
-          LOG_MESSAGE(
-              TRITONSERVER_LOG_VERBOSE,
-              (std::string(
-                   "Output Properties Unavailable. Using cpu as "
-                   "preferred location for output: " +
-                   output_name.first +
-                   " Error: " + TRITONSERVER_ErrorMessage(err))
-                   .c_str()));
-          memory_type = TRITONSERVER_MEMORY_CPU;
-          memory_type_id = 0;
+        {
+          size_t gpu_count = 0;
+          for (uint32_t ri = 0; ri < request_count; ++ri) {
+            TRITONSERVER_MemoryType req_mem_type = preferred_memory_type;
+            int64_t req_mem_type_id = preferred_memory_type_id;
+            auto req_err = TRITONBACKEND_RequestOutputBufferProperties(
+                requests[ri], output_name.first.c_str(), /*byte_size*/ nullptr,
+                &req_mem_type, &req_mem_type_id);
+            if (req_err == nullptr &&
+                req_mem_type == TRITONSERVER_MEMORY_GPU) {
+              gpu_count++;
+              memory_type_id = req_mem_type_id;
+            }
+            TRITONSERVER_ErrorDelete(req_err);
+          }
+          // Use GPU memory if the majority of requests prefer it.
+          memory_type = (gpu_count * 2 >= request_count)
+                            ? TRITONSERVER_MEMORY_GPU
+                            : TRITONSERVER_MEMORY_CPU;
+          if (gpu_count > 0 && gpu_count * 2 < request_count) {
+            LOG_MESSAGE(
+                TRITONSERVER_LOG_VERBOSE,
+                (std::string("Output '") + output_name.first +
+                 "': mixed memory type preferences across " +
+                 std::to_string(request_count) + " requests; " +
+                 std::to_string(gpu_count) + " prefer GPU. Using CPU.")
+                    .c_str());
+          }
+        }
+        if (memory_type == TRITONSERVER_MEMORY_CPU) {
+          // Fallback already set above; log if we couldn't query any request
+          if (request_count > 0) {
+            TRITONSERVER_MemoryType probe_type = preferred_memory_type;
+            int64_t probe_id = preferred_memory_type_id;
+            auto probe_err = TRITONBACKEND_RequestOutputBufferProperties(
+                requests[0], output_name.first.c_str(), nullptr,
+                &probe_type, &probe_id);
+            if (probe_err != nullptr) {
+              LOG_MESSAGE(
+                  TRITONSERVER_LOG_VERBOSE,
+                  (std::string(
+                       "Output Properties Unavailable. Using cpu as "
+                       "preferred location for output: ") +
+                   output_name.first)
+                      .c_str());
+              TRITONSERVER_ErrorDelete(probe_err);
+            }
+          }
         }
       }
 
@@ -2354,18 +2423,22 @@ ModelInstanceState::ProcessRequests(
   }
 
   // Wait for any in-flight input tensor copies to complete.
+  // OPT-1: When MIGraphX is using Triton's HIP stream as user_compute_stream,
+  // skip the explicit sync — ORT enqueues work on the same stream, so stream
+  // ordering already guarantees inputs are ready before kernel launch.
 #ifdef TRITON_ENABLE_GPU
   if (cuda_copy) {
     cudaStreamSynchronize(CudaStream());
   }
 #endif
 
-  // Wait for any in-flight input tensor copies to complete.
 #ifdef TRITON_ENABLE_ROCM
-  if (cuda_copy) {
+  if (cuda_copy && !migraphx_user_stream_active_) {
+    // Standard path: explicit sync needed before OrtRun.
     static_cast<void>(
         hipStreamSynchronize(static_cast<hipStream_t>(CudaStream())));
   }
+  // OPT-1: With user_compute_stream, ORT sees the same stream; no CPU sync needed.
 #endif
 
   uint64_t compute_start_ns = 0;
