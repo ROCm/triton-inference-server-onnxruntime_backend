@@ -66,6 +66,15 @@
 #include <hip/hip_runtime_api.h>
 #endif  // TRITON_ENABLE_ROCM
 
+// Unified stream type: hipStream_t for ROCm builds, cudaStream_t for CUDA builds.
+// Used in LoadModel() and CudaStream() shim to avoid type mismatches when
+// compiling with TRITON_ENABLE_ROCM=1 only (no TRITON_ENABLE_GPU).
+#if defined(TRITON_ENABLE_ROCM) && !defined(TRITON_ENABLE_GPU)
+using TritonStream_t = hipStream_t;
+#else
+using TritonStream_t = cudaStream_t;
+#endif  // TRITON_ENABLE_ROCM && !TRITON_ENABLE_GPU
+
 
 //
 // ONNX Runtime Backend that implements the TRITONBACKEND API.
@@ -135,7 +144,7 @@ class ModelState : public BackendModel {
       const TRITONSERVER_InstanceGroupKind instance_group_kind,
       const int32_t instance_group_device_id, std::string* model_path,
       OrtSession** session, OrtAllocator** default_allocator,
-      cudaStream_t stream);
+      TritonStream_t stream);
 
   const std::map<std::string, std::pair<int64_t, int64_t>>& ModelOutputs()
   {
@@ -419,7 +428,7 @@ ModelState::LoadModel(
     const std::string& artifact_name,
     const TRITONSERVER_InstanceGroupKind instance_group_kind,
     const int32_t instance_group_device_id, std::string* model_path,
-    OrtSession** session, OrtAllocator** default_allocator, cudaStream_t stream)
+    OrtSession** session, OrtAllocator** default_allocator, TritonStream_t stream)
 {
   // Find the ONNX file that describes the model itself. If the model
   // configuration doesn't have an explicit model file specified then
@@ -1511,8 +1520,9 @@ class ModelInstanceState : public BackendModelInstance {
   // OPT-6: ROCm-build compatibility shim.
   // When building with TRITON_ENABLE_ROCM only (no TRITON_ENABLE_GPU), the
   // hipified BackendModelInstance exposes RocmStream() instead of CudaStream().
+  // Returns TritonStream_t so it is compatible with LoadModel() signature.
 #if defined(TRITON_ENABLE_ROCM) && !defined(TRITON_ENABLE_GPU)
-  hipStream_t CudaStream() { return RocmStream(); }
+  TritonStream_t CudaStream() { return static_cast<TritonStream_t>(RocmStream()); }
 #endif  // TRITON_ENABLE_ROCM && !TRITON_ENABLE_GPU
   ModelInstanceState(
       ModelState* model_state,
