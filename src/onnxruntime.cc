@@ -924,7 +924,8 @@ ModelState::LoadModel(
                 keys.push_back("user_compute_stream");
                 values.push_back(
                     std::to_string(reinterpret_cast<size_t>(stream)));
-                migraphx_user_stream_active_ = true;  // OPT-1
+                // NOTE: migraphx_user_stream_active_ is set in
+                // ModelInstanceState constructor after LoadModel() returns.
               }
 
               std::vector<const char*> c_keys, c_values;
@@ -1646,6 +1647,9 @@ ModelInstanceState::ModelInstanceState(
   THROW_IF_BACKEND_INSTANCE_ERROR(model_state->LoadModel(
       ArtifactFilename(), Kind(), DeviceId(), &model_path_, &session_,
       &default_allocator_, CudaStream()));
+  // OPT-1: track whether user_compute_stream was active for this instance.
+  // CudaStream() returns non-null for GPU instances.
+  migraphx_user_stream_active_ = (CudaStream() != nullptr);
 
 #ifdef TRITON_ENABLE_GPU
   if (Kind() == TRITONSERVER_INSTANCEGROUPKIND_GPU) {
