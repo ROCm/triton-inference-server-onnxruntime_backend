@@ -1506,6 +1506,14 @@ class ModelInstanceState : public BackendModelInstance {
       TRITONBACKEND_Request** requests, const uint32_t request_count);
 
  private:
+
+  // Stream compatibility shim inserted here
+  // OPT-6: ROCm-build compatibility shim.
+  // When building with TRITON_ENABLE_ROCM only (no TRITON_ENABLE_GPU), the
+  // hipified BackendModelInstance exposes RocmStream() instead of CudaStream().
+#if defined(TRITON_ENABLE_ROCM) && !defined(TRITON_ENABLE_GPU)
+  hipStream_t CudaStream() { return RocmStream(); }
+#endif  // TRITON_ENABLE_ROCM && !TRITON_ENABLE_GPU
   ModelInstanceState(
       ModelState* model_state,
       TRITONBACKEND_ModelInstance* triton_model_instance);
