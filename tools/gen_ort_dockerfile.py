@@ -25,6 +25,23 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+# Modifications Copyright (c) 2024-2025 Advanced Micro Devices, Inc.
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+
 import argparse
 import os
 import platform
@@ -119,6 +136,7 @@ def dockerfile_for_linux(output_file):
 # Ensure apt-get won't prompt for selecting options
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
+ENV CMAKE_POLICY_VERSION_MINIMUM=3.5
 
 # The Onnx Runtime dockerfile is the collection of steps in
 # https://github.com/microsoft/onnxruntime/tree/master/dockerfiles
@@ -149,7 +167,7 @@ RUN dnf install -y \\
         wget \\
         zip
 
-RUN pipx install cmake==4.0.3 --force
+RUN pipx install cmake==3.31.10 --force
 
 RUN pip3 install patchelf==0.17.2 numpy>=2.0.0
 """
@@ -188,13 +206,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \\
         zip
 
 RUN pip3 install \\
-       cmake==4.0.3 \\
+       cmake==3.31.10 \\
        numpy \\
        packaging \\
        patchelf==0.17.2 \\
        wheel>=0.35.1
 
 ENV VERBOSE=1
+"""
+
+    # ROCm: install build tools; MIGraphX and ONNX Runtime are built from source below
+    if FLAGS.enable_rocm:
+        df += """
+# ROCm: install build tools (MIGraphX and ONNX Runtime built from source in this image)
+RUN apt-get update && \\
+    apt-get install -y --no-install-recommends \\
+        sudo git apt-utils bash build-essential curl \\
+        python3-dev python3-pip aria2 libnuma-dev pkg-config ccache \\
+    && rm -rf /var/lib/apt/lists/*
 """
 
     if FLAGS.ort_openvino is not None:
@@ -246,11 +275,54 @@ ENV PYTHONPATH=$INTEL_OPENVINO_DIR/python/python3.12:$INTEL_OPENVINO_DIR/python/
             openvino_toolkit_filename, openvino_folder_name
         )
 
-    ## TEMPORARY: Using the tensorrt-8.0 branch until ORT 1.9 release to enable ORT backend with TRT 8.0 support.
+    # ROCm: Build MIGraphX and ONNX Runtime from source (NVIDIA-style, inside this image)
+    if FLAGS.enable_rocm:
+        df += """
+#
+# Build MIGraphX from source
+#
+ARG MIGRAPHX_REPO={}
+ARG MIGRAPHX_BRANCH={}
+ARG ONNXRUNTIME_VERSION
+ARG ONNXRUNTIME_REPO={}
+ARG ONNXRUNTIME_BRANCH={}
+ARG ONNXRUNTIME_BUILD_CONFIG
+
+RUN pip3 install --no-cache-dir wheel build && \\
+    git clone ${{MIGRAPHX_REPO}} --recursive -b ${{MIGRAPHX_BRANCH}} migraphx_src && \\
+    cd migraphx_src && \\
+    pip3 install --no-cache-dir https://github.com/RadeonOpenCompute/rbuild/archive/master.tar.gz && \\
+    rbuild build -d depend -B build -DMIGRAPHX_ENABLE_PYTHON=OFF -DGPU_TARGETS=gfx942 2>&1 | tee migraphx_build.log && \\
+    cd build && \\
+    make -j$(nproc) package && dpkg -i *.deb
+
+ENV MIGRAPHX_MLIR_USE_SPECIFIC_OPS=attention,dot
+ENV MIGRAPHX_ENABLE_MLIR_GEG_FUSION=1
+ENV MIGRAPHX_ENABLE_REWRITE_DOT=1
+
+#
+# Build ONNX Runtime with MIGraphX EP from source
+#
+RUN rm -rf onnxruntime && \\
+    git clone ${{ONNXRUNTIME_REPO}} --recursive -b ${{ONNXRUNTIME_BRANCH}} onnxruntime && \\
+    cd onnxruntime && \\
+    pip install numpy packaging && \\
+    ./build.sh --config ${{ONNXRUNTIME_BUILD_CONFIG}} --allow_running_as_root --rocm_home /opt/rocm --use_migraphx --migraphx_home /opt/rocm --skip_tests --parallel --enable_pybind --build_wheel 2>&1 | tee onnxrt_build.log && \\
+    pip install ./build/Linux/Release/dist/*.whl --force-reinstall && \\
+    cd build/Linux/Release && \\
+    cmake --install . --prefix /opt/rocm && \\
+    echo "ONNX Runtime installed to /opt/rocm with headers and libraries"
+""".format(
+            FLAGS.migraphx_repo,
+            FLAGS.migraphx_branch,
+            FLAGS.onnxruntime_repo,
+            FLAGS.onnxruntime_branch,
+        )
+    # TEMPORARY: Using the tensorrt-8.0 branch until ORT 1.9 release to enable ORT backend with TRT 8.0 support.
     # For ORT versions 1.8.0 and below the behavior will remain same. For ORT version 1.8.1 we will
     # use tensorrt-8.0 branch instead of using rel-1.8.1
     # From ORT 1.9 onwards we will switch back to using rel-* branches
-    if FLAGS.ort_version == "1.8.1":
+    elif FLAGS.ort_version == "1.8.1":
         df += """
 #
 # ONNX Runtime build
@@ -287,12 +359,14 @@ ARG ONNXRUNTIME_BUILD_CONFIG
 RUN git clone -b rel-${ONNXRUNTIME_VERSION} --recursive ${ONNXRUNTIME_REPO} onnxruntime
         """
 
-    if FLAGS.onnx_tensorrt_tag != "":
-        df += """
+    # Skip onnx-tensorrt tag and build for ROCm (using pre-built)
+    if not FLAGS.enable_rocm:
+        if FLAGS.onnx_tensorrt_tag != "":
+            df += """
     RUN (cd /workspace/onnxruntime/cmake/external/onnx-tensorrt && git fetch origin {}:ortrefbranch && git checkout ortrefbranch)
     """.format(
-            FLAGS.onnx_tensorrt_tag
-        )
+                FLAGS.onnx_tensorrt_tag
+            )
 
     ep_flags = ""
     if FLAGS.enable_gpu:
@@ -351,19 +425,73 @@ RUN git clone -b rel-${ONNXRUNTIME_VERSION} --recursive ${ONNXRUNTIME_REPO} onnx
         else:
             cuda_archs = "75;80;86;90;100;120"
 
-    df += """
+    # Skip build.sh for ROCm (using pre-built)
+    if not FLAGS.enable_rocm:
+        df += """
 WORKDIR /workspace/onnxruntime
-ARG COMMON_BUILD_ARGS="--config ${{ONNXRUNTIME_BUILD_CONFIG}} --parallel --skip_submodule_sync --build_shared_lib \
+ARG COMMON_BUILD_ARGS="--config ${{ONNXRUNTIME_BUILD_CONFIG}} --parallel --skip_submodule_sync --build_shared_lib \\
     --compile_no_warning_as_error --build_dir /workspace/build --cmake_extra_defines CMAKE_CUDA_ARCHITECTURES='{}'  --cmake_extra_defines CMAKE_POLICY_VERSION_MINIMUM=3.5 --build_wheel"
 """.format(
-        cuda_archs
-    )
+            cuda_archs
+        )
 
-    df += """
+        df += """
 RUN ./build.sh ${{COMMON_BUILD_ARGS}} --update --build {}
 """.format(
-        ep_flags
-    )
+            ep_flags
+        )
+
+    # ROCm: Copy built ONNX Runtime artifacts to /opt/onnxruntime
+    if FLAGS.enable_rocm:
+        df += """
+#
+# Copy ONNX Runtime artifacts from build to /opt/onnxruntime
+#
+WORKDIR /workspace
+
+RUN mkdir -p /opt/onnxruntime/lib /opt/onnxruntime/include
+
+# Find and copy shared libraries from pip-installed onnxruntime
+# Note: Only MIGraphX EP is used, ROCm EP is skipped
+RUN SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])") && \\
+    echo "Found site-packages at: $SITE_PACKAGES" && \\
+    cp $SITE_PACKAGES/onnxruntime/capi/libonnxruntime.so.* /opt/onnxruntime/lib/ && \\
+    cp $SITE_PACKAGES/onnxruntime/capi/libonnxruntime_providers_shared.so /opt/onnxruntime/lib/ && \\
+    cp $SITE_PACKAGES/onnxruntime/capi/libonnxruntime_providers_migraphx.so /opt/onnxruntime/lib/ && \\
+    cd /opt/onnxruntime/lib && \\
+    ORT_SO=$(ls libonnxruntime.so.* | head -1) && \\
+    ln -sf $ORT_SO libonnxruntime.so.1 && \\
+    ln -sf $ORT_SO libonnxruntime.so
+
+# Copy MIGraphX runtime libraries (built in this image via dpkg) into /opt/onnxruntime/lib
+# so they are included in final artifacts; the provider loads libmigraphx_c.so.3 at runtime.
+# Search /usr, /opt/rocm, /usr/local, and /workspace (dpkg installs to /opt/rocm; build tree under /workspace).
+RUN find /usr /opt/rocm /usr/local /workspace -name 'libmigraphx*.so*' 2>/dev/null | while read f; do cp -P "$f" /opt/onnxruntime/lib/; done && \\
+    (ls /opt/onnxruntime/lib/libmigraphx*.so* 2>/dev/null && echo "MIGraphX runtime libs copied to /opt/onnxruntime/lib") || echo "No MIGraphX libs found under /usr, /opt/rocm, /usr/local, or /workspace"
+
+# Copy header files from installed ONNX Runtime
+# Headers are in /opt/rocm/include/onnxruntime/ (from cmake install)
+RUN echo "Copying header files from /opt/rocm/include/onnxruntime/" && \\
+    cp /opt/rocm/include/onnxruntime/onnxruntime_c_api.h /opt/onnxruntime/include/ && \\
+    cp /opt/rocm/include/onnxruntime/onnxruntime_session_options_config_keys.h /opt/onnxruntime/include/ && \\
+    cp /opt/rocm/include/onnxruntime/cpu_provider_factory.h /opt/onnxruntime/include/ && \\
+    (cp /opt/rocm/include/onnxruntime/onnxruntime_ep_c_api.h /opt/onnxruntime/include/ 2>/dev/null || echo "EP header not found, skipping") && \\
+    echo "${ONNXRUNTIME_VERSION}" > /opt/onnxruntime/ort_onnx_version.txt && \\
+    echo "ONNX Runtime headers and libraries copied to /opt/onnxruntime"
+
+# Set RPATH for all .so files
+RUN cd /opt/onnxruntime/lib && \\
+    for i in `find . -mindepth 1 -maxdepth 1 -type f -name '*\\.so*'`; do \\
+        patchelf --set-rpath '$ORIGIN' $i || true; \\
+    done
+
+# Create bin and test directories
+RUN mkdir -p /opt/onnxruntime/bin /opt/onnxruntime/test
+"""
+        # Write dockerfile and return early for ROCm
+        with open(output_file, "w") as dfile:
+            dfile.write(df)
+        return
 
     df += """
 #
@@ -479,7 +607,7 @@ RUN mkdir -p /opt/onnxruntime/test && \
 def dockerfile_for_windows(output_file):
     df = dockerfile_common()
 
-    ## TEMPORARY: Using the tensorrt-8.0 branch until ORT 1.9 release to enable ORT backend with TRT 8.0 support.
+    # TEMPORARY: Using the tensorrt-8.0 branch until ORT 1.9 release to enable ORT backend with TRT 8.0 support.
     # For ORT versions 1.8.0 and below the behavior will remain same. For ORT version 1.8.1 we will
     # use tensorrt-8.0 branch instead of using rel-1.8.1
     # From ORT 1.9 onwards we will switch back to using rel-* branches
@@ -616,15 +744,16 @@ def preprocess_gpu_flags():
         if FLAGS.tensorrt_home is None:
             FLAGS.tensorrt_home = "/tensorrt"
     else:
-        if "CUDNN_VERSION" in os.environ:
-            if FLAGS.cudnn_home is None:
-                FLAGS.cudnn_home = "/usr"
+        if not FLAGS.enable_rocm:
+            if "CUDNN_VERSION" in os.environ:
+                if FLAGS.cudnn_home is None:
+                    FLAGS.cudnn_home = "/usr"
 
-        if FLAGS.cuda_home is None:
-            FLAGS.cuda_home = "/usr/local/cuda"
+            if FLAGS.cuda_home is None:
+                FLAGS.cuda_home = "/usr/local/cuda"
 
-        if (FLAGS.cuda_home is None) or (FLAGS.cudnn_home is None):
-            print("error: linux build requires --cudnn-home and --cuda-home")
+            if (FLAGS.cuda_home is None) or (FLAGS.cudnn_home is None):
+                print("error: linux build requires --cudnn-home and --cuda-home")
 
         if FLAGS.tensorrt_home is None:
             if target_platform() == "rhel":
@@ -634,6 +763,11 @@ def preprocess_gpu_flags():
                     FLAGS.tensorrt_home = "/usr/local/cuda/targets/x86_64-linux/"
             else:
                 FLAGS.tensorrt_home = "/usr/src/tensorrt"
+
+        # ROCm defaults
+        if FLAGS.enable_rocm:
+            if FLAGS.rocm_home is None:
+                FLAGS.rocm_home = "/opt/rocm"
 
 
 if __name__ == "__main__":
@@ -695,8 +829,52 @@ if __name__ == "__main__":
     )
     parser.add_argument("--trt-version", type=str, default="", help="TRT version.")
 
+    # ROCm/MIGraphX arguments
+    parser.add_argument(
+        "--enable-rocm",
+        action="store_true",
+        required=False,
+        help="Enable ROCm GPU support",
+    )
+    parser.add_argument(
+        "--rocm-version", type=str, required=False, help="Version for ROCm."
+    )
+    parser.add_argument(
+        "--rocm-home", type=str, required=False, help="Home directory for ROCm."
+    )
+    parser.add_argument(
+        "--ort-migraphx",
+        action="store_true",
+        required=False,
+        help="Enable MIGraphX execution provider.",
+    )
+    parser.add_argument(
+        "--onnxruntime-repo",
+        type=str,
+        default="https://github.com/ROCm/onnxruntime",
+        help="ONNX Runtime (ROCm) git repo URL for build-from-source.",
+    )
+    parser.add_argument(
+        "--onnxruntime-branch",
+        type=str,
+        default="target_batch_compile",
+        help="ONNX Runtime (ROCm) git branch for build-from-source.",
+    )
+    parser.add_argument(
+        "--migraphx-repo",
+        type=str,
+        default="https://github.com/ROCm/AMDMIGraphX.git",
+        help="MIGraphX git repo URL for build-from-source.",
+    )
+    parser.add_argument(
+        "--migraphx-branch",
+        type=str,
+        default="release/rocm-rel-7.2",
+        help="MIGraphX git branch for build-from-source.",
+    )
+
     FLAGS = parser.parse_args()
-    if FLAGS.enable_gpu:
+    if FLAGS.enable_gpu or FLAGS.enable_rocm:
         preprocess_gpu_flags()
 
     # if a tag is provided by the user, then simply use it
