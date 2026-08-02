@@ -138,6 +138,8 @@ set(TRITON_BUILD_ONNXRUNTIME_REPO "" CACHE STRING "ONNX Runtime (ROCm) git repo 
 set(TRITON_BUILD_ONNXRUNTIME_BRANCH "" CACHE STRING "ONNX Runtime (ROCm) git branch for build-from-source")
 set(TRITON_BUILD_MIGRAPHX_REPO "" CACHE STRING "MIGraphX git repo URL for build-from-source")
 set(TRITON_BUILD_MIGRAPHX_BRANCH "" CACHE STRING "MIGraphX git branch for build-from-source")
+set(TRITON_BUILD_MIGRAPHX_EP_REPO "" CACHE STRING "MIGraphX plugin EP (onnxruntime-ep-amdgpu) git repo URL for build-from-source")
+set(TRITON_BUILD_MIGRAPHX_EP_BRANCH "" CACHE STRING "MIGraphX plugin EP (onnxruntime-ep-amdgpu) git branch for build-from-source")
 set(TRITON_BUILD_ONNXRUNTIME_OPENVINO_VERSION "" CACHE STRING "ONNXRuntime OpenVINO version to build")
 set(TRITON_BUILD_TARGET_PLATFORM "" CACHE STRING "Target platform for ONNXRuntime build")
 set(TRITON_BUILD_CUDA_VERSION "" CACHE STRING "Version of CUDA install")
@@ -467,7 +469,9 @@ if(TRITON_ONNXRUNTIME_DOCKER_BUILD)
   if(${TRITON_ENABLE_ONNXRUNTIME_ROCM})
     set(_GEN_FLAGS ${_GEN_FLAGS} "--enable-rocm")
   endif() # TRITON_ENABLE_ONNXRUNTIME_ROCM
-  # MIGraphX is already installed in base image, just enable it
+  # MIGraphX support is provided by the out-of-tree plugin EP
+  # (onnxruntime-ep-amdgpu). --ort-migraphx enables building/staging that plugin
+  # (libmigraphx-ep.so); the built-in MIGraphX EP is no longer compiled into ORT.
   if(${TRITON_ENABLE_ONNXRUNTIME_MIGRAPHX})
     set(_GEN_FLAGS ${_GEN_FLAGS} "--ort-migraphx")
   endif() # TRITON_ENABLE_ONNXRUNTIME_MIGRAPHX
@@ -482,6 +486,12 @@ if(TRITON_ONNXRUNTIME_DOCKER_BUILD)
   endif()
   if(NOT ${TRITON_BUILD_MIGRAPHX_BRANCH} STREQUAL "")
     set(_GEN_FLAGS ${_GEN_FLAGS} "--migraphx-branch=${TRITON_BUILD_MIGRAPHX_BRANCH}")
+  endif()
+  if(NOT ${TRITON_BUILD_MIGRAPHX_EP_REPO} STREQUAL "")
+    set(_GEN_FLAGS ${_GEN_FLAGS} "--migraphx-ep-repo=${TRITON_BUILD_MIGRAPHX_EP_REPO}")
+  endif()
+  if(NOT ${TRITON_BUILD_MIGRAPHX_EP_BRANCH} STREQUAL "")
+    set(_GEN_FLAGS ${_GEN_FLAGS} "--migraphx-ep-branch=${TRITON_BUILD_MIGRAPHX_EP_BRANCH}")
   endif()
 
   set(ENABLE_GPU_EXTRA_ARGS "")

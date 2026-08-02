@@ -70,6 +70,12 @@ class OnnxLoader {
   /// If the loader is not initialized it returns false.
   static bool IsGlobalThreadPoolEnabled();
 
+  /// Returns the process-wide OrtEnv owned by the loader singleton, or nullptr
+  /// if the loader has not been initialized. Needed by the MIGraphX plugin EP
+  /// path, which must select an OrtEpDevice registered against this env when
+  /// appending the provider via SessionOptionsAppendExecutionProvider_V2.
+  static OrtEnv* Env();
+
  private:
   OnnxLoader(OrtEnv* env, bool enable_global_threadpool = false)
       : env_(env), global_threadpool_enabled_(enable_global_threadpool),

@@ -301,22 +301,52 @@ ENV MIGRAPHX_ENABLE_MLIR_GEG_FUSION=1
 ENV MIGRAPHX_ENABLE_REWRITE_DOT=1
 
 #
-# Build ONNX Runtime with MIGraphX EP from source
+# Build ONNX Runtime core from source (no built-in MIGraphX EP).
+# MIGraphX support is provided out-of-tree by the plugin EP built below.
 #
 RUN rm -rf onnxruntime && \\
     git clone ${{ONNXRUNTIME_REPO}} --recursive -b ${{ONNXRUNTIME_BRANCH}} onnxruntime && \\
     cd onnxruntime && \\
     pip install numpy packaging && \\
-    ./build.sh --config ${{ONNXRUNTIME_BUILD_CONFIG}} --allow_running_as_root --rocm_home /opt/rocm --use_migraphx --migraphx_home /opt/rocm --skip_tests --parallel --enable_pybind --build_wheel 2>&1 | tee onnxrt_build.log && \\
+    ./build.sh --config ${{ONNXRUNTIME_BUILD_CONFIG}} --allow_running_as_root --rocm_home /opt/rocm --skip_tests --parallel --enable_pybind --build_wheel 2>&1 | tee onnxrt_build.log && \\
     pip install ./build/Linux/Release/dist/*.whl --force-reinstall && \\
     cd build/Linux/Release && \\
     cmake --install . --prefix /opt/rocm && \\
-    echo "ONNX Runtime installed to /opt/rocm with headers and libraries"
+    echo "ONNX Runtime core installed to /opt/rocm with headers and libraries"
+
+#
+# Build the out-of-tree MIGraphX plugin EP (onnxruntime-ep-amdgpu ->
+# libmigraphx-ep.so). This mirrors build_migraphx_ep_standalone.sh, building the
+# plugin against the ONNX Runtime core (installed to /opt/rocm above) and the
+# MIGraphX install (/opt/rocm). The resulting libmigraphx-ep.so is registered at
+# runtime by the Triton backend via RegisterExecutionProviderLibrary.
+#
+ARG MIGRAPHX_EP_REPO={}
+ARG MIGRAPHX_EP_BRANCH={}
+RUN rm -rf onnxruntime-ep-amdgpu && \\
+    git clone ${{MIGRAPHX_EP_REPO}} --recursive -b ${{MIGRAPHX_EP_BRANCH}} onnxruntime-ep-amdgpu && \\
+    cd onnxruntime-ep-amdgpu && \\
+    git config --global --add safe.directory "*" && \\
+    export PATH="/opt/cmake/bin:$PATH" && \\
+    export CXXFLAGS="-D__HIP_PLATFORM_AMD__=1 -w" && \\
+    ./build.sh --config ${{ONNXRUNTIME_BUILD_CONFIG}} \\
+        --cmake_generator Ninja \\
+        --onnxrt_home /opt/rocm \\
+        --use_migraphx \\
+        --migraphx_home /opt/rocm \\
+        --compile_no_warning_as_error \\
+        --allow_running_as_root \\
+        --parallel \\
+        --build_dir build.EP.MGX \\
+        --hip_path /opt/rocm 2>&1 | tee migraphx_ep_build.log && \\
+    echo "MIGraphX plugin EP built at /workspace/onnxruntime-ep-amdgpu/build.EP.MGX/${{ONNXRUNTIME_BUILD_CONFIG}}/src/migraphx/libmigraphx-ep.so"
 """.format(
             FLAGS.migraphx_repo,
             FLAGS.migraphx_branch,
             FLAGS.onnxruntime_repo,
             FLAGS.onnxruntime_branch,
+            FLAGS.migraphx_ep_repo,
+            FLAGS.migraphx_ep_branch,
         )
     ## TEMPORARY: Using the tensorrt-8.0 branch until ORT 1.9 release to enable ORT backend with TRT 8.0 support.
     # For ORT versions 1.8.0 and below the behavior will remain same. For ORT version 1.8.1 we will
@@ -451,17 +481,24 @@ WORKDIR /workspace
 
 RUN mkdir -p /opt/onnxruntime/lib /opt/onnxruntime/include
 
-# Find and copy shared libraries from pip-installed onnxruntime
-# Note: Only MIGraphX EP is used, ROCm EP is skipped
+# Find and copy shared libraries from pip-installed onnxruntime core.
+# Note: the built-in MIGraphX provider is no longer built; MIGraphX is provided
+# by the plugin EP (libmigraphx-ep.so) staged below.
 RUN SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])") && \\
     echo "Found site-packages at: $SITE_PACKAGES" && \\
     cp $SITE_PACKAGES/onnxruntime/capi/libonnxruntime.so.* /opt/onnxruntime/lib/ && \\
     cp $SITE_PACKAGES/onnxruntime/capi/libonnxruntime_providers_shared.so /opt/onnxruntime/lib/ && \\
-    cp $SITE_PACKAGES/onnxruntime/capi/libonnxruntime_providers_migraphx.so /opt/onnxruntime/lib/ && \\
     cd /opt/onnxruntime/lib && \\
     ORT_SO=$(ls libonnxruntime.so.* | head -1) && \\
     ln -sf $ORT_SO libonnxruntime.so.1 && \\
     ln -sf $ORT_SO libonnxruntime.so
+
+# Stage the MIGraphX plugin EP shared library. The Triton ONNX Runtime backend
+# registers this at runtime via RegisterExecutionProviderLibrary; the default
+# lookup path is /opt/tritonserver/backends/onnxruntime/libmigraphx-ep.so, which
+# is where the backend install places the contents of /opt/onnxruntime/lib.
+RUN cp /workspace/onnxruntime-ep-amdgpu/build.EP.MGX/${ONNXRUNTIME_BUILD_CONFIG}/src/migraphx/libmigraphx-ep.so /opt/onnxruntime/lib/ && \\
+    echo "MIGraphX plugin EP (libmigraphx-ep.so) staged to /opt/onnxruntime/lib"
 
 # Copy MIGraphX runtime libraries (built in this image via dpkg) into /opt/onnxruntime/lib
 # so they are included in final artifacts; the provider loads libmigraphx_c.so.3 at runtime.
@@ -848,13 +885,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--onnxruntime-repo",
         type=str,
-        default="https://github.com/ROCm/onnxruntime",
+        default="https://github.com/Microsoft/onnxruntime",
         help="ONNX Runtime (ROCm) git repo URL for build-from-source.",
     )
     parser.add_argument(
         "--onnxruntime-branch",
         type=str,
-        default="target_batch_compile",
+        default="v1.27.0",
         help="ONNX Runtime (ROCm) git branch for build-from-source.",
     )
     parser.add_argument(
@@ -868,6 +905,20 @@ if __name__ == "__main__":
         type=str,
         default="release/rocm-rel-7.2",
         help="MIGraphX git branch for build-from-source.",
+    )
+    parser.add_argument(
+        "--migraphx-ep-repo",
+        type=str,
+        default="https://github.com/ROCm/onnxruntime-ep-amdgpu.git",
+        help="MIGraphX plugin EP (onnxruntime-ep-amdgpu) git repo URL for "
+        "build-from-source.",
+    )
+    parser.add_argument(
+        "--migraphx-ep-branch",
+        type=str,
+        default="main",
+        help="MIGraphX plugin EP (onnxruntime-ep-amdgpu) git branch for "
+        "build-from-source.",
     )
 
     FLAGS = parser.parse_args()
