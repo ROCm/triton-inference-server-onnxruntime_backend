@@ -335,10 +335,14 @@ RUN rm -rf onnxruntime-ep-amdgpu && \\
         --use_migraphx \\
         --migraphx_home /opt/rocm \\
         --compile_no_warning_as_error \\
-        --allow_running_as_root \\
-        --parallel \\
+        --parallel $(nproc) \\
         --build_dir build.EP.MGX \\
-        --hip_path /opt/rocm 2>&1 | tee migraphx_ep_build.log && \\
+        --hip_path /opt/rocm \\
+        --build_wheel 2>&1 | tee migraphx_ep_build.log; \\
+    if [ ! -f build.EP.MGX/${{ONNXRUNTIME_BUILD_CONFIG}}/src/migraphx/libmigraphx-ep.so ]; then \\
+        echo "ERROR: MIGraphX plugin EP build failed; libmigraphx-ep.so was not produced. See the build output / migraphx_ep_build.log above for the underlying error (e.g. an unrecognized build.sh flag, or find_package(onnxruntime)/find_package(migraphx) not resolvable under /opt/rocm)."; \\
+        exit 1; \\
+    fi && \\
     echo "MIGraphX plugin EP built at /workspace/onnxruntime-ep-amdgpu/build.EP.MGX/${{ONNXRUNTIME_BUILD_CONFIG}}/src/migraphx/libmigraphx-ep.so"
 """.format(
             FLAGS.migraphx_repo,
