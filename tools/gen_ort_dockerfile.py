@@ -321,16 +321,25 @@ RUN rm -rf onnxruntime && \\
 # MIGraphX install (/opt/rocm). The resulting libmigraphx-ep.so is registered at
 # runtime by the Triton backend via RegisterExecutionProviderLibrary.
 #
+# NOTE: onnxruntime-ep-amdgpu/CMakeLists.txt requires CMake >= 4.2, which is
+# newer than the cmake shipped in the base image (/opt/cmake/bin). We therefore
+# install a compatible cmake (and ninja) via pip for this build step only and
+# point build.sh at it explicitly with --cmake_path, leaving the image's system
+# cmake untouched for every other build stage.
+#
 ARG MIGRAPHX_EP_REPO={}
 ARG MIGRAPHX_EP_BRANCH={}
 RUN rm -rf onnxruntime-ep-amdgpu && \\
     git clone ${{MIGRAPHX_EP_REPO}} --recursive -b ${{MIGRAPHX_EP_BRANCH}} onnxruntime-ep-amdgpu && \\
     cd onnxruntime-ep-amdgpu && \\
     git config --global --add safe.directory "*" && \\
-    export PATH="/opt/cmake/bin:$PATH" && \\
+    pip3 install --no-cache-dir --upgrade "cmake>=4.2" ninja && \\
+    MGX_EP_CMAKE_BIN=$(python3 -c "import cmake, os; print(os.path.join(os.path.dirname(cmake.__file__), 'data', 'bin'))") && \\
+    export PATH="$MGX_EP_CMAKE_BIN:$PATH" && \\
     export CXXFLAGS="-D__HIP_PLATFORM_AMD__=1 -w" && \\
     ./build.sh --config ${{ONNXRUNTIME_BUILD_CONFIG}} \\
         --cmake_generator Ninja \\
+        --cmake_path "$MGX_EP_CMAKE_BIN/cmake" \\
         --onnxrt_home /opt/rocm \\
         --use_migraphx \\
         --migraphx_home /opt/rocm \\
