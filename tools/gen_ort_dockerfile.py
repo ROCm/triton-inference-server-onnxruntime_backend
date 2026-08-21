@@ -537,15 +537,16 @@ RUN cp /workspace/onnxruntime-ep-amdgpu/build.EP.MGX/${ONNXRUNTIME_BUILD_CONFIG}
 RUN find /usr /opt/rocm /usr/local /workspace -name 'libmigraphx*.so*' 2>/dev/null | while read f; do cp -P "$f" /opt/onnxruntime/lib/; done && \\
     (ls /opt/onnxruntime/lib/libmigraphx*.so* 2>/dev/null && echo "MIGraphX runtime libs copied to /opt/onnxruntime/lib") || echo "No MIGraphX libs found under /usr, /opt/rocm, /usr/local, or /workspace"
 
-# Copy header files from the prebuilt ONNX Runtime dist.
-# The upstream tarball lays headers out flat under include/.
-RUN echo "Copying header files from /opt/onnxruntime-dist/include/" && \\
-    cp /opt/onnxruntime-dist/include/onnxruntime_c_api.h /opt/onnxruntime/include/ && \\
-    cp /opt/onnxruntime-dist/include/onnxruntime_session_options_config_keys.h /opt/onnxruntime/include/ && \\
-    cp /opt/onnxruntime-dist/include/cpu_provider_factory.h /opt/onnxruntime/include/ && \\
-    (cp /opt/onnxruntime-dist/include/onnxruntime_ep_c_api.h /opt/onnxruntime/include/ 2>/dev/null || echo "EP header not found, skipping") && \\
+# Copy the full ONNX Runtime header set from the prebuilt dist. ORT splits the C
+# API across several headers (e.g. onnxruntime_c_api.h -> onnxruntime_error_code.h,
+# onnxruntime_ep_c_api.h, onnxruntime_cxx_api.h, ...), so copy the whole include/
+# tree rather than a hand-picked subset to stay robust across versions. The
+# backend install excludes include/ from the final artifact, so this only affects
+# the compile step, not the packaged backend size.
+RUN echo "Copying ONNX Runtime headers from /opt/onnxruntime-dist/include/" && \\
+    cp -a /opt/onnxruntime-dist/include/. /opt/onnxruntime/include/ && \\
     echo "${ONNXRUNTIME_VERSION}" > /opt/onnxruntime/ort_onnx_version.txt && \\
-    echo "ONNX Runtime headers and libraries copied to /opt/onnxruntime"
+    echo "ONNX Runtime headers copied to /opt/onnxruntime/include"
 
 # Set RPATH for all .so files
 RUN cd /opt/onnxruntime/lib && \\
@@ -922,7 +923,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--onnxruntime-branch",
         type=str,
-        default="v1.27.0",
+        default="v1.29.0",
         help="ONNX Runtime (ROCm) git branch for build-from-source.",
     )
     parser.add_argument(
@@ -934,20 +935,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--migraphx-branch",
         type=str,
-        default="release/rocm-rel-7.2",
+        default="develop",
         help="MIGraphX git branch for build-from-source.",
     )
     parser.add_argument(
         "--migraphx-ep-repo",
         type=str,
-        default="https://github.com/ROCm/onnxruntime-ep-amdgpu.git",
+        default="https://github.com/onnxruntime/onnxruntime-ep-amdgpu.git",
         help="MIGraphX plugin EP (onnxruntime-ep-amdgpu) git repo URL for "
         "build-from-source.",
     )
     parser.add_argument(
         "--migraphx-ep-branch",
         type=str,
-        default="main",
+        default="add_migx_precompile",
         help="MIGraphX plugin EP (onnxruntime-ep-amdgpu) git branch for "
         "build-from-source.",
     )

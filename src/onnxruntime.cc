@@ -873,6 +873,14 @@ ModelState::LoadModel(
                         param_key.c_str(), &value_string));
                     keys.push_back("coalesce_io");
                     values.push_back(value_string == "true" ? "1" : "0");
+                  } else if (param_key == "precompile_at_load") {
+                    // Plugin-only knob: compile missing MXR programs at session
+                    // create (after preload). When false, compilation is deferred
+                    // to the first Compute() for each missing batch bucket.
+                    RETURN_IF_ERROR(params.MemberAsString(
+                        param_key.c_str(), &value_string));
+                    keys.push_back("precompile_at_load");
+                    values.push_back(value_string == "true" ? "1" : "0");
                   } else {
                     return TRITONSERVER_ErrorNew(
                         TRITONSERVER_ERROR_INVALID_ARG,
