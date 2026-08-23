@@ -45,7 +45,9 @@
 
 #include <stdint.h>
 
+#include <cstdlib>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "onnxruntime_loader.h"
@@ -2503,6 +2505,18 @@ ModelInstanceState::SetInputTensors(
 {
   const int max_batch_size = model_state_->MaxBatchSize();
 
+  // When ORT_MIGRAPHX_INPUTS_ON_HOST is set, keep inputs host-resident (pinned)
+  // for GPU instances instead of pre-copying them to device in the collector.
+  // This hands the execution provider CPU-resident inputs so the MIGraphX
+  // plugin EP's coalesced-input path (ORT_MIGRAPHX_COALESCE_IO) can batch every
+  // per-input H2D into a single transfer, rather than Triton issuing one H2D
+  // per input here. Defaults off (inputs bound on device, prior behavior).
+  static const bool inputs_on_host{[] {
+    const char* value{std::getenv("ORT_MIGRAPHX_INPUTS_ON_HOST")};
+    return value != nullptr &&
+           (std::string(value) == "1" || std::string(value) == "true");
+  }()};
+
   // All requests must have equally-sized input tensors so use any
   // request as the representative for the input tensors.
   uint32_t input_count;
@@ -2567,12 +2581,15 @@ ModelInstanceState::SetInputTensors(
       int64_t memory_type_id;
       std::vector<std::pair<TRITONSERVER_MemoryType, int64_t>>
           allowed_input_types;
-      if (Kind() == TRITONSERVER_INSTANCEGROUPKIND_GPU) {
+      if (Kind() == TRITONSERVER_INSTANCEGROUPKIND_GPU && !inputs_on_host) {
         allowed_input_types = {
             {TRITONSERVER_MEMORY_GPU, DeviceId()},
             {TRITONSERVER_MEMORY_CPU_PINNED, 0},
             {TRITONSERVER_MEMORY_CPU, 0}};
       } else {
+        // Host-resident inputs (pinned preferred). For GPU instances this is
+        // gated by ORT_MIGRAPHX_INPUTS_ON_HOST so the EP performs a single
+        // coalesced H2D instead of one copy per input in the collector.
         allowed_input_types = {
             {TRITONSERVER_MEMORY_CPU_PINNED, 0}, {TRITONSERVER_MEMORY_CPU, 0}};
       }
