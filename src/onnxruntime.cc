@@ -773,9 +773,11 @@ ModelState::LoadModel(
               // against the process-wide OrtEnv in OnnxLoader::Init(). Provider
               // options are passed as string key/value pairs and the provider is
               // appended via SessionOptionsAppendExecutionProvider_V2 against the
-              // plugin's OrtEpDevice for the target GPU. The stream is supplied
-              // by ONNX Runtime through the stream-aware plugin interface, so no
-              // "user_compute_stream" option is passed here. Option keys use the
+              // plugin's OrtEpDevice for the target GPU. This instance's HIP
+              // stream is passed as "user_compute_stream" (see below) so the
+              // plugin adopts it instead of creating its own -- unifying Triton's
+              // I/O copies and the model's compute onto one stream, matching the
+              // classic built-in MIGraphXExecutionProvider. Option keys use the
               // plugin's native names; the plugin also accepts the classic
               // "migraphx_*" aliases for backward compatibility.
               std::vector<std::string> keys, values;
@@ -929,6 +931,20 @@ ModelState::LoadModel(
                   selected_device == nullptr, TRITONSERVER_ERROR_UNAVAILABLE,
                   std::string("MIGraphX plugin EP is not available; ensure "
                               "libmigraphx-ep.so is present and registered"));
+
+              // Hand this instance's compute stream to the plugin so it adopts
+              // the stream instead of creating its own. The V2 append is
+              // string-only, so the handle is passed as a decimal pointer
+              // address; the plugin parses it back to the hipStream_t (matching
+              // the classic built-in EP's user_compute_stream). A non-null handle
+              // implies has_user_compute_stream on the plugin side.
+              if (stream != nullptr) {
+                keys.push_back("user_compute_stream");
+                values.push_back(std::to_string(
+                    reinterpret_cast<uintptr_t>(stream)));
+                keys.push_back("has_user_compute_stream");
+                values.push_back("1");
+              }
 
               std::vector<const char*> c_keys, c_values;
               for (size_t i = 0; i < keys.size(); ++i) {
