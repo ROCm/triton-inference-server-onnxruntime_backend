@@ -948,7 +948,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--migraphx-ep-branch",
         type=str,
-        default="update_memory_sync_copies",
+        default="reduce_compute_io_overhead",
         help="MIGraphX plugin EP (onnxruntime-ep-amdgpu) git branch for "
         "build-from-source.",
     )
