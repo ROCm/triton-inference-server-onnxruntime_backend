@@ -138,6 +138,14 @@ set(TRITON_BUILD_ONNXRUNTIME_REPO "" CACHE STRING "ONNX Runtime (ROCm) git repo 
 set(TRITON_BUILD_ONNXRUNTIME_BRANCH "" CACHE STRING "ONNX Runtime (ROCm) git branch for build-from-source")
 set(TRITON_BUILD_MIGRAPHX_REPO "" CACHE STRING "MIGraphX git repo URL for build-from-source")
 set(TRITON_BUILD_MIGRAPHX_BRANCH "" CACHE STRING "MIGraphX git branch for build-from-source")
+set(TRITON_BUILD_MIGRAPHX_BUILD_MODE "" CACHE STRING "How to provision MIGraphX: 'source' (build --migraphx-branch, reusing prebuilt rocMLIR) or 'package' (pull prebuilt amdrocm-migraphx debs, skipping the MIGraphX/rocMLIR source builds)")
+set(TRITON_BUILD_MIGRAPHX_PACKAGE_URL "" CACHE STRING "Base URL of the prebuilt amdrocm-migraphx .deb pool (used when TRITON_BUILD_MIGRAPHX_BUILD_MODE=package)")
+set(TRITON_BUILD_MIGRAPHX_PACKAGE_VERSION "" CACHE STRING "Version tag of the prebuilt amdrocm-migraphx packages (used when TRITON_BUILD_MIGRAPHX_BUILD_MODE=package); must match the base ROCm train and Python, e.g. 2.16.0-3.py311")
+set(TRITON_BUILD_ROCMLIR_REPO "" CACHE STRING "rocMLIR git repo URL; prebuilt once (librockCompiler) into its own cached Docker layer so MIGraphX links it instead of rebuilding LLVM/MLIR")
+set(TRITON_BUILD_ROCMLIR_COMMIT "" CACHE STRING "rocMLIR git commit to prebuild; must match the ROCm/rocMLIR@<sha> pin in MIGraphX's requirements.txt for ABI compatibility")
+set(TRITON_BUILD_MIGRAPHX_EP_REPO "" CACHE STRING "MIGraphX plugin EP (onnxruntime-ep-amdgpu) git repo URL for build-from-source")
+set(TRITON_BUILD_MIGRAPHX_EP_BRANCH "" CACHE STRING "MIGraphX plugin EP (onnxruntime-ep-amdgpu) git branch for build-from-source")
+set(TRITON_BUILD_MIGRAPHX_EP_CACHE_BUST "" CACHE STRING "Cache-bust token for the MIGraphX plugin EP (onnxruntime-ep-amdgpu) Docker build stage; changing it forces only the EP to rebuild while reusing the cached MIGraphX/ONNX Runtime layers")
 set(TRITON_BUILD_ONNXRUNTIME_OPENVINO_VERSION "" CACHE STRING "ONNXRuntime OpenVINO version to build")
 set(TRITON_BUILD_TARGET_PLATFORM "" CACHE STRING "Target platform for ONNXRuntime build")
 set(TRITON_BUILD_CUDA_VERSION "" CACHE STRING "Version of CUDA install")
@@ -206,8 +214,13 @@ else()
 
   set(TRITON_ONNXRUNTIME_DOCKER_IMAGE "tritonserver_onnxruntime")
   set(TRITON_ONNXRUNTIME_DOCKER_MEMORY "$<IF:$<BOOL:WIN32>,32g,8g>")
+  # Enable Docker layer caching by default. The expensive, rarely-changing stages
+  # (MIGraphX built from source, prebuilt ONNX Runtime core download) are then
+  # built once and reused across rebuilds instead of being recompiled every time.
+  # Override with -DTRITON_ONNXRUNTIME_DOCKER_CACHE_ARGS=--no-cache to force a
+  # full clean rebuild.
   if(NOT DEFINED TRITON_ONNXRUNTIME_DOCKER_CACHE_ARGS)
-    set(TRITON_ONNXRUNTIME_DOCKER_CACHE_ARGS "--no-cache")
+    set(TRITON_ONNXRUNTIME_DOCKER_CACHE_ARGS "")
   endif()
   set(TRITON_ONNXRUNTIME_INCLUDE_PATHS "${CMAKE_CURRENT_BINARY_DIR}/onnxruntime/include")
 
@@ -467,7 +480,9 @@ if(TRITON_ONNXRUNTIME_DOCKER_BUILD)
   if(${TRITON_ENABLE_ONNXRUNTIME_ROCM})
     set(_GEN_FLAGS ${_GEN_FLAGS} "--enable-rocm")
   endif() # TRITON_ENABLE_ONNXRUNTIME_ROCM
-  # MIGraphX is already installed in base image, just enable it
+  # MIGraphX support is provided by the out-of-tree plugin EP
+  # (onnxruntime-ep-amdgpu). --ort-migraphx enables building/staging that plugin
+  # (libmigraphx-ep.so); the built-in MIGraphX EP is no longer compiled into ORT.
   if(${TRITON_ENABLE_ONNXRUNTIME_MIGRAPHX})
     set(_GEN_FLAGS ${_GEN_FLAGS} "--ort-migraphx")
   endif() # TRITON_ENABLE_ONNXRUNTIME_MIGRAPHX
@@ -483,18 +498,47 @@ if(TRITON_ONNXRUNTIME_DOCKER_BUILD)
   if(NOT ${TRITON_BUILD_MIGRAPHX_BRANCH} STREQUAL "")
     set(_GEN_FLAGS ${_GEN_FLAGS} "--migraphx-branch=${TRITON_BUILD_MIGRAPHX_BRANCH}")
   endif()
+  if(NOT ${TRITON_BUILD_MIGRAPHX_BUILD_MODE} STREQUAL "")
+    set(_GEN_FLAGS ${_GEN_FLAGS} "--migraphx-build-mode=${TRITON_BUILD_MIGRAPHX_BUILD_MODE}")
+  endif()
+  if(NOT ${TRITON_BUILD_MIGRAPHX_PACKAGE_URL} STREQUAL "")
+    set(_GEN_FLAGS ${_GEN_FLAGS} "--migraphx-package-url=${TRITON_BUILD_MIGRAPHX_PACKAGE_URL}")
+  endif()
+  if(NOT ${TRITON_BUILD_MIGRAPHX_PACKAGE_VERSION} STREQUAL "")
+    set(_GEN_FLAGS ${_GEN_FLAGS} "--migraphx-package-version=${TRITON_BUILD_MIGRAPHX_PACKAGE_VERSION}")
+  endif()
+  if(NOT ${TRITON_BUILD_ROCMLIR_REPO} STREQUAL "")
+    set(_GEN_FLAGS ${_GEN_FLAGS} "--rocmlir-repo=${TRITON_BUILD_ROCMLIR_REPO}")
+  endif()
+  if(NOT ${TRITON_BUILD_ROCMLIR_COMMIT} STREQUAL "")
+    set(_GEN_FLAGS ${_GEN_FLAGS} "--rocmlir-commit=${TRITON_BUILD_ROCMLIR_COMMIT}")
+  endif()
+  if(NOT ${TRITON_BUILD_MIGRAPHX_EP_REPO} STREQUAL "")
+    set(_GEN_FLAGS ${_GEN_FLAGS} "--migraphx-ep-repo=${TRITON_BUILD_MIGRAPHX_EP_REPO}")
+  endif()
+  if(NOT ${TRITON_BUILD_MIGRAPHX_EP_BRANCH} STREQUAL "")
+    set(_GEN_FLAGS ${_GEN_FLAGS} "--migraphx-ep-branch=${TRITON_BUILD_MIGRAPHX_EP_BRANCH}")
+  endif()
 
   set(ENABLE_GPU_EXTRA_ARGS "")
   if(${TRITON_ENABLE_GPU})
     set(ENABLE_GPU_EXTRA_ARGS "--enable-gpu")
   endif() # TRITON_ENABLE_GPU
 
+  # Cache-bust argument applied only to the MIGraphX plugin EP build stage so the
+  # EP is rebuilt (picking up new commits on its branch) while the cached
+  # MIGraphX and ONNX Runtime core layers are reused untouched.
+  set(MIGRAPHX_EP_DOCKER_ARGS "")
+  if(${TRITON_ENABLE_ONNXRUNTIME_MIGRAPHX})
+    set(MIGRAPHX_EP_DOCKER_ARGS --build-arg MIGRAPHX_EP_CACHE_BUST=${TRITON_BUILD_MIGRAPHX_EP_CACHE_BUST})
+  endif() # TRITON_ENABLE_ONNXRUNTIME_MIGRAPHX
+
   if (WIN32)
     add_custom_command(
       OUTPUT
         onnxruntime/lib/${ONNXRUNTIME_LIBRARY}
       COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_ort_dockerfile.py --triton-container="${TRITON_BUILD_CONTAINER}" --ort-version="${TRITON_BUILD_ONNXRUNTIME_VERSION}" --trt-version="${TRT_VERSION}" --onnx-tensorrt-tag="${TRITON_ONNX_TENSORRT_REPO_TAG}" ${_GEN_FLAGS} --output=Dockerfile.ort ${ENABLE_GPU_EXTRA_ARGS}
-      COMMAND docker build --memory ${TRITON_ONNXRUNTIME_DOCKER_MEMORY} ${TRITON_ONNXRUNTIME_DOCKER_CACHE_ARGS} -t ${TRITON_ONNXRUNTIME_DOCKER_IMAGE} -f ./Dockerfile.ort ${CMAKE_CURRENT_SOURCE_DIR}
+      COMMAND docker build --memory ${TRITON_ONNXRUNTIME_DOCKER_MEMORY} ${TRITON_ONNXRUNTIME_DOCKER_CACHE_ARGS} ${MIGRAPHX_EP_DOCKER_ARGS} -t ${TRITON_ONNXRUNTIME_DOCKER_IMAGE} -f ./Dockerfile.ort ${CMAKE_CURRENT_SOURCE_DIR}
       COMMAND powershell.exe -noprofile -c "docker rm onnxruntime_backend_ort > $null 2>&1; if ($LASTEXITCODE) { 'error ignored...' }; exit 0"
       COMMAND docker create --name onnxruntime_backend_ort ${TRITON_ONNXRUNTIME_DOCKER_IMAGE}
       COMMAND rmdir /s/q onnxruntime
@@ -507,7 +551,7 @@ if(TRITON_ONNXRUNTIME_DOCKER_BUILD)
       OUTPUT
         onnxruntime/lib/${ONNXRUNTIME_LIBRARY}
       COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_ort_dockerfile.py  --ort-build-config="${CMAKE_BUILD_TYPE}" --triton-container="${TRITON_BUILD_CONTAINER}" --ort-version="${TRITON_BUILD_ONNXRUNTIME_VERSION}" --trt-version="${TRT_VERSION}" --onnx-tensorrt-tag="${TRITON_ONNX_TENSORRT_REPO_TAG}" ${_GEN_FLAGS} --output=Dockerfile.ort ${ENABLE_GPU_EXTRA_ARGS}
-      COMMAND docker build ${TRITON_ONNXRUNTIME_DOCKER_CACHE_ARGS} -t ${TRITON_ONNXRUNTIME_DOCKER_IMAGE} -f ./Dockerfile.ort ${CMAKE_CURRENT_SOURCE_DIR}
+      COMMAND docker build ${TRITON_ONNXRUNTIME_DOCKER_CACHE_ARGS} ${MIGRAPHX_EP_DOCKER_ARGS} -t ${TRITON_ONNXRUNTIME_DOCKER_IMAGE} -f ./Dockerfile.ort ${CMAKE_CURRENT_SOURCE_DIR}
       COMMAND docker rm onnxruntime_backend_ort || echo 'error ignored...' || true
       COMMAND docker create --name onnxruntime_backend_ort ${TRITON_ONNXRUNTIME_DOCKER_IMAGE}
       COMMAND rm -fr onnxruntime

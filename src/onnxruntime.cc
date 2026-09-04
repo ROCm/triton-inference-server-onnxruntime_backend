@@ -45,7 +45,9 @@
 
 #include <stdint.h>
 
+#include <cstdlib>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "onnxruntime_loader.h"
@@ -768,8 +770,18 @@ ModelState::LoadModel(
 #endif  // TRITON_ENABLE_ONNXRUNTIME_TENSORRT
 #ifdef TRITON_ENABLE_ONNXRUNTIME_MIGRAPHX
             if (name == kMIGraphXExecutionAccelerator) {
-              // Build MIGraphX provider options as string key-value pairs
-              // so the stream pointer can be passed via the ProviderOptions map.
+              // MIGraphX is served by the out-of-tree plugin EP
+              // (onnxruntime-ep-amdgpu -> libmigraphx-ep.so), registered once
+              // against the process-wide OrtEnv in OnnxLoader::Init(). Provider
+              // options are passed as string key/value pairs and the provider is
+              // appended via SessionOptionsAppendExecutionProvider_V2 against the
+              // plugin's OrtEpDevice for the target GPU. This instance's HIP
+              // stream is passed as "user_compute_stream" (see below) so the
+              // plugin adopts it instead of creating its own -- unifying Triton's
+              // I/O copies and the model's compute onto one stream, matching the
+              // classic built-in MIGraphXExecutionProvider. Option keys use the
+              // plugin's native names; the plugin also accepts the classic
+              // "migraphx_*" aliases for backward compatibility.
               std::vector<std::string> keys, values;
               std::string int8_calibration_table_name;
               std::string model_cache_dir;
@@ -788,16 +800,16 @@ ModelState::LoadModel(
                     RETURN_IF_ERROR(params.MemberAsString(
                         param_key.c_str(), &value_string));
                     if (value_string == "FP16") {
-                      keys.push_back("migraphx_fp16_enable");
+                      keys.push_back("fp16_enable");
                       values.push_back("1");
                     } else if (value_string == "BF16") {
-                      keys.push_back("migraphx_bf16_enable");
+                      keys.push_back("bf16_enable");
                       values.push_back("1");
                     } else if (value_string == "FP8") {
-                      keys.push_back("migraphx_fp8_enable");
+                      keys.push_back("fp8_enable");
                       values.push_back("1");
                     } else if (value_string == "INT8") {
-                      keys.push_back("migraphx_int8_enable");
+                      keys.push_back("int8_enable");
                       values.push_back("1");
                     } else if (value_string != "FP32") {
                       RETURN_ERROR_IF_FALSE(
@@ -808,7 +820,7 @@ ModelState::LoadModel(
                   } else if (param_key == "int8_calibration_table_name") {
                     RETURN_IF_ERROR(params.MemberAsString(
                         param_key.c_str(), &int8_calibration_table_name));
-                    keys.push_back("migraphx_int8_calibration_table_name");
+                    keys.push_back("int8_calibration_table_name");
                     values.push_back(int8_calibration_table_name);
                   } else if (param_key == "int8_use_native_calibration_table") {
                     RETURN_IF_ERROR(params.MemberAsString(
@@ -816,29 +828,63 @@ ModelState::LoadModel(
                     int use_native_calibration_table;
                     RETURN_IF_ERROR(ParseIntValue(
                         value_string, &use_native_calibration_table));
-                    keys.push_back(
-                        "migraphx_int8_use_native_calibration_table");
+                    keys.push_back("int8_use_native_calibration_table");
                     values.push_back(std::to_string(
                         use_native_calibration_table));
-                  } else if (param_key == "migraphx_model_cache_dir") {
+                  } else if (
+                      param_key == "migraphx_model_cache_dir" ||
+                      param_key == "cache_dir") {
+                    // The plugin EP's cache option is "cache_dir" (the classic
+                    // "migraphx_model_cache_dir" has no plugin alias, so map it
+                    // here for config.pbtxt backward compatibility).
                     RETURN_IF_ERROR(params.MemberAsString(
                         param_key.c_str(), &model_cache_dir));
-                    keys.push_back("migraphx_model_cache_dir");
+                    keys.push_back("cache_dir");
                     values.push_back(model_cache_dir);
-                  } else if (param_key == "migraphx_max_dynamic_batch") {
+                  } else if (
+                      param_key == "migraphx_max_dynamic_batch" ||
+                      param_key == "max_dynamic_batch") {
                     RETURN_IF_ERROR(params.MemberAsString(
                         param_key.c_str(), &value_string));
                     size_t max_dynamic_batch;
                     RETURN_IF_ERROR(ParseUnsignedLongLongValue(
                         value_string, &max_dynamic_batch));
-                    keys.push_back("migraphx_max_dynamic_batch");
+                    keys.push_back("max_dynamic_batch");
                     values.push_back(std::to_string(max_dynamic_batch));
-                  } else if (param_key == "migraphx_exhaustive_tune") {
+                  } else if (
+                      param_key == "migraphx_exhaustive_tune" ||
+                      param_key == "exhaustive_tune") {
                     RETURN_IF_ERROR(params.MemberAsString(
                         param_key.c_str(), &value_string));
-                    keys.push_back("migraphx_exhaustive_tune");
-                    values.push_back(
-                        value_string == "true" ? "1" : "0");
+                    keys.push_back("exhaustive_tune");
+                    values.push_back(value_string == "true" ? "1" : "0");
+                  } else if (param_key == "compile_batches") {
+                    // Plugin-only knob: comma-separated list of batch sizes to
+                    // pre-compile (e.g. "1,2,4,8,16,32").
+                    RETURN_IF_ERROR(params.MemberAsString(
+                        param_key.c_str(), &value_string));
+                    keys.push_back("compile_batches");
+                    values.push_back(value_string);
+                  } else if (param_key == "hip_graph_enable") {
+                    // Plugin-only knob: enable hipGraph capture/replay.
+                    RETURN_IF_ERROR(params.MemberAsString(
+                        param_key.c_str(), &value_string));
+                    keys.push_back("hip_graph_enable");
+                    values.push_back(value_string == "true" ? "1" : "0");
+                  } else if (param_key == "coalesce_io") {
+                    // Plugin-only knob: coalesce I/O staging buffers.
+                    RETURN_IF_ERROR(params.MemberAsString(
+                        param_key.c_str(), &value_string));
+                    keys.push_back("coalesce_io");
+                    values.push_back(value_string == "true" ? "1" : "0");
+                  } else if (param_key == "precompile_at_load") {
+                    // Plugin-only knob: compile missing MXR programs at session
+                    // create (after preload). When false, compilation is deferred
+                    // to the first Compute() for each missing batch bucket.
+                    RETURN_IF_ERROR(params.MemberAsString(
+                        param_key.c_str(), &value_string));
+                    keys.push_back("precompile_at_load");
+                    values.push_back(value_string == "true" ? "1" : "0");
                   } else {
                     return TRITONSERVER_ErrorNew(
                         TRITONSERVER_ERROR_INVALID_ARG,
@@ -851,10 +897,55 @@ ModelState::LoadModel(
                 }
               }
 
+              // Select the plugin's OrtEpDevice for the target GPU. The plugin
+              // exposes one OrtEpDevice per HIP device, enumerated in device-id
+              // order, all reporting Ep name "MIGraphX".
+              OrtEnv* ort_env = OnnxLoader::Env();
+              RETURN_ERROR_IF_TRUE(
+                  ort_env == nullptr, TRITONSERVER_ERROR_INTERNAL,
+                  std::string("ONNX Runtime environment is not initialized; "
+                              "cannot append MIGraphX plugin EP"));
+
+              const OrtEpDevice* const* ep_devices = nullptr;
+              size_t num_ep_devices = 0;
+              RETURN_IF_ORT_ERROR(
+                  ort_api->GetEpDevices(ort_env, &ep_devices, &num_ep_devices));
+
+              const OrtEpDevice* selected_device = nullptr;
+              int migraphx_device_idx = 0;
+              for (size_t i = 0; i < num_ep_devices; ++i) {
+                const char* ep_name = ort_api->EpDevice_EpName(ep_devices[i]);
+                if (ep_name != nullptr && std::string(ep_name) == "MIGraphX") {
+                  // Fall back to the first MIGraphX device if the exact index is
+                  // not matched.
+                  if (selected_device == nullptr) {
+                    selected_device = ep_devices[i];
+                  }
+                  if (migraphx_device_idx == instance_group_device_id) {
+                    selected_device = ep_devices[i];
+                    break;
+                  }
+                  ++migraphx_device_idx;
+                }
+              }
+
+              RETURN_ERROR_IF_TRUE(
+                  selected_device == nullptr, TRITONSERVER_ERROR_UNAVAILABLE,
+                  std::string("MIGraphX plugin EP is not available; ensure "
+                              "libmigraphx-ep.so is present and registered"));
+
+              // Hand this instance's compute stream to the plugin so it adopts
+              // the stream instead of creating its own. The V2 append is
+              // string-only, so the handle is passed as a decimal pointer
+              // address; the plugin parses it back to the hipStream_t (matching
+              // the classic built-in EP's user_compute_stream). A non-null handle
+              // implies has_user_compute_stream on the plugin side.
               if (stream != nullptr) {
                 keys.push_back("user_compute_stream");
                 values.push_back(std::to_string(
-                    reinterpret_cast<size_t>(stream)));
+                    reinterpret_cast<uintptr_t>(stream)));
+                keys.push_back("has_user_compute_stream");
+                values.push_back("1");
               }
 
               std::vector<const char*> c_keys, c_values;
@@ -863,15 +954,15 @@ ModelState::LoadModel(
                 c_values.push_back(values[i].c_str());
               }
               RETURN_IF_ORT_ERROR(
-                  ort_api->SessionOptionsAppendExecutionProvider(
-                      soptions, "MIGraphX",
-                      c_keys.data(), c_values.data(), keys.size()));
+                  ort_api->SessionOptionsAppendExecutionProvider_V2(
+                      soptions, ort_env, &selected_device, 1, c_keys.data(),
+                      c_values.data(), keys.size()));
               LOG_MESSAGE(
                   TRITONSERVER_LOG_VERBOSE,
-                  (std::string("MIGraphX Execution Accelerator is set for '") +
+                  (std::string(
+                       "MIGraphX plugin Execution Accelerator is set for '") +
                    Name() + "' on device " +
-                   std::to_string(instance_group_device_id) +
-                   (stream != nullptr ? " with user compute stream" : ""))
+                   std::to_string(instance_group_device_id))
                       .c_str());
               continue;
             }
@@ -2414,6 +2505,18 @@ ModelInstanceState::SetInputTensors(
 {
   const int max_batch_size = model_state_->MaxBatchSize();
 
+  // When ORT_MIGRAPHX_INPUTS_ON_HOST is set, keep inputs host-resident (pinned)
+  // for GPU instances instead of pre-copying them to device in the collector.
+  // This hands the execution provider CPU-resident inputs so the MIGraphX
+  // plugin EP's coalesced-input path (ORT_MIGRAPHX_COALESCE_IO) can batch every
+  // per-input H2D into a single transfer, rather than Triton issuing one H2D
+  // per input here. Defaults off (inputs bound on device, prior behavior).
+  static const bool inputs_on_host{[] {
+    const char* value{std::getenv("ORT_MIGRAPHX_INPUTS_ON_HOST")};
+    return value != nullptr &&
+           (std::string(value) == "1" || std::string(value) == "true");
+  }()};
+
   // All requests must have equally-sized input tensors so use any
   // request as the representative for the input tensors.
   uint32_t input_count;
@@ -2478,12 +2581,15 @@ ModelInstanceState::SetInputTensors(
       int64_t memory_type_id;
       std::vector<std::pair<TRITONSERVER_MemoryType, int64_t>>
           allowed_input_types;
-      if (Kind() == TRITONSERVER_INSTANCEGROUPKIND_GPU) {
+      if (Kind() == TRITONSERVER_INSTANCEGROUPKIND_GPU && !inputs_on_host) {
         allowed_input_types = {
             {TRITONSERVER_MEMORY_GPU, DeviceId()},
             {TRITONSERVER_MEMORY_CPU_PINNED, 0},
             {TRITONSERVER_MEMORY_CPU, 0}};
       } else {
+        // Host-resident inputs (pinned preferred). For GPU instances this is
+        // gated by ORT_MIGRAPHX_INPUTS_ON_HOST so the EP performs a single
+        // coalesced H2D instead of one copy per input in the collector.
         allowed_input_types = {
             {TRITONSERVER_MEMORY_CPU_PINNED, 0}, {TRITONSERVER_MEMORY_CPU, 0}};
       }

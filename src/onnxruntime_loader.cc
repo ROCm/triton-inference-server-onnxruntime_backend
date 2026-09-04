@@ -27,6 +27,7 @@
 #include "onnxruntime_loader.h"
 
 #include <codecvt>
+#include <cstdlib>
 #include <future>
 #include <locale>
 #include <string>
@@ -113,6 +114,41 @@ OnnxLoader::Init(common::TritonJson::Value& backend_config)
 
     loader.reset(new OnnxLoader(env, global_threadpool_enabled));
     RETURN_IF_ORT_ERROR(status);
+
+#ifdef TRITON_ENABLE_ONNXRUNTIME_MIGRAPHX
+    // Register the out-of-tree MIGraphX plugin EP (onnxruntime-ep-amdgpu ->
+    // libmigraphx-ep.so) against this process-wide env. This replaces the
+    // built-in MIGraphX EP that used to be compiled into ONNX Runtime. The
+    // registration name ("MIGraphX") becomes the EP name reported by the
+    // plugin's OrtEpFactory::GetName, and is matched later when selecting the
+    // OrtEpDevice for SessionOptionsAppendExecutionProvider_V2.
+    {
+      const char* lib_env = std::getenv("TRITON_ONNXRUNTIME_MIGRAPHX_EP_LIBRARY");
+      const std::string migraphx_ep_lib =
+          (lib_env != nullptr && lib_env[0] != '\0')
+              ? std::string(lib_env)
+              : std::string(
+                    "/opt/tritonserver/backends/onnxruntime/libmigraphx-ep.so");
+      OrtStatus* reg_status = ort_api->RegisterExecutionProviderLibrary(
+          env, "MIGraphX", migraphx_ep_lib.c_str());
+      if (reg_status != nullptr) {
+        // Non-fatal: log and continue so non-MIGraphX models still load. Models
+        // requesting the MIGraphX accelerator will fail later at append time.
+        LOG_MESSAGE(
+            TRITONSERVER_LOG_WARN,
+            (std::string("Failed to register MIGraphX plugin EP library '") +
+             migraphx_ep_lib + "': " + ort_api->GetErrorMessage(reg_status))
+                .c_str());
+        ort_api->ReleaseStatus(reg_status);
+      } else {
+        LOG_MESSAGE(
+            TRITONSERVER_LOG_VERBOSE,
+            (std::string("Registered MIGraphX plugin EP library '") +
+             migraphx_ep_lib + "'")
+                .c_str());
+      }
+    }
+#endif  // TRITON_ENABLE_ONNXRUNTIME_MIGRAPHX
   } else {
     return TRITONSERVER_ErrorNew(
         TRITONSERVER_ERROR_ALREADY_EXISTS,
@@ -161,6 +197,16 @@ OnnxLoader::IsGlobalThreadPoolEnabled()
   }
 
   return false;
+}
+
+OrtEnv*
+OnnxLoader::Env()
+{
+  if (loader != nullptr) {
+    return loader->env_;
+  }
+
+  return nullptr;
 }
 
 TRITONSERVER_Error*

@@ -275,48 +275,205 @@ ENV PYTHONPATH=$INTEL_OPENVINO_DIR/python/python3.12:$INTEL_OPENVINO_DIR/python/
             openvino_toolkit_filename, openvino_folder_name
         )
 
-    # ROCm: Build MIGraphX and ONNX Runtime from source (NVIDIA-style, inside this image)
+    # ROCm: provision MIGraphX (either build the specified branch from source
+    # with a prebuilt rocMLIR, or pull prebuilt MIGraphX packages), then fetch
+    # the prebuilt ONNX Runtime core and build the out-of-tree plugin EP.
     if FLAGS.enable_rocm:
-        df += """
+        if FLAGS.migraphx_build_mode == "package":
+            df += """
 #
-# Build MIGraphX from source
+# Provision MIGraphX from prebuilt packages (no MIGraphX/rocMLIR source build).
+#
+# Pulls amdrocm-migraphx (runtime libs) and amdrocm-migraphx-dev (headers +
+# migraphxConfig.cmake). The prebuilt library already has rocMLIR statically
+# linked, so there is NO LLVM/MLIR compile and NO MIGraphX source build -- only
+# a package download + install. MIGRAPHX_PACKAGE_VERSION must match the base
+# image ROCm train (e.g. 2.17.0 => rocm10.0.0) and Debian release (debian12).
+#
+ARG MIGRAPHX_PACKAGE_URL={}
+ARG MIGRAPHX_PACKAGE_VERSION={}
+ARG ONNXRUNTIME_VERSION
+ARG ONNXRUNTIME_BUILD_CONFIG
+
+RUN (command -v curl >/dev/null 2>&1 || (apt-get update && apt-get install -y --no-install-recommends curl ca-certificates)) && \\
+    cd /tmp && \\
+    MIGRAPHX_PACKAGE_VERSION_URL="$(printf '%s' "${{MIGRAPHX_PACKAGE_VERSION}}" | sed 's/+/%2B/g')" && \\
+    curl -fSL -o amdrocm-migraphx_${{MIGRAPHX_PACKAGE_VERSION}}_amd64.deb ${{MIGRAPHX_PACKAGE_URL}}/amdrocm-migraphx_${{MIGRAPHX_PACKAGE_VERSION_URL}}_amd64.deb && \\
+    curl -fSL -o amdrocm-migraphx-dev_${{MIGRAPHX_PACKAGE_VERSION}}_amd64.deb ${{MIGRAPHX_PACKAGE_URL}}/amdrocm-migraphx-dev_${{MIGRAPHX_PACKAGE_VERSION_URL}}_amd64.deb && \\
+    (dpkg -i --force-depends /tmp/amdrocm-migraphx_${{MIGRAPHX_PACKAGE_VERSION}}_amd64.deb /tmp/amdrocm-migraphx-dev_${{MIGRAPHX_PACKAGE_VERSION}}_amd64.deb || (apt-get update && apt-get install -f -y)) && \\
+    rm -f /tmp/amdrocm-migraphx*.deb && \\
+    find /opt/rocm -iname 'migraphx*config*.cmake' -o -iname 'migraphxConfig.cmake' | tee /tmp/migraphx_cmake_files.txt && \\
+    if [ ! -s /tmp/migraphx_cmake_files.txt ]; then \\
+        echo "ERROR: migraphx CMake package config not found under /opt/rocm after installing prebuilt packages; find_package(migraphx) will fail downstream. Verify --migraphx-package-version matches the base ROCm train and Debian release (e.g. 2.17.0+rocm10.0.0 for debian12)."; \\
+        exit 1; \\
+    fi
+""".format(
+                FLAGS.migraphx_package_url,
+                FLAGS.migraphx_package_version,
+            )
+        else:
+            df += """
+#
+# Build rocMLIR (librockCompiler) ONCE from a pinned commit into /opt/rocmlir.
+#
+# This is the expensive LLVM/MLIR compile. MIGraphX consumes rocMLIR as the
+# static rocMLIR::rockCompiler library (find_package(rocMLIR) in
+# src/targets/gpu/CMakeLists.txt), so building it here as its own Docker layer --
+# keyed only by ROCMLIR_REPO/ROCMLIR_COMMIT -- decouples the LLVM/MLIR build from
+# the (frequently-changing) MIGraphX and plugin-EP source: changing
+# MIGRAPHX_BRANCH or the EP no longer triggers an LLVM rebuild. ROCMLIR_COMMIT
+# MUST match the ROCm/rocMLIR@<sha> pin in MIGraphX's requirements.txt for ABI
+# compatibility; bump it to force a rocMLIR rebuild.
+#
+ARG ROCMLIR_REPO={}
+ARG ROCMLIR_COMMIT={}
+RUN pip3 install --no-cache-dir ninja && \\
+    ROCM_CLANGXX=""; for c in /opt/rocm/llvm/bin/clang++ /opt/rocm/lib/llvm/bin/clang++; do if [ -x "$c" ]; then ROCM_CLANGXX="$c"; break; fi; done && \\
+    CC_ARGS=""; if [ -n "$ROCM_CLANGXX" ]; then CC_ARGS="-DCMAKE_CXX_COMPILER=$ROCM_CLANGXX -DCMAKE_C_COMPILER=${{ROCM_CLANGXX%++}}"; fi && \\
+    echo "Building rocMLIR ${{ROCMLIR_COMMIT}} (C++ compiler: ${{ROCM_CLANGXX:-<system default>}})" && \\
+    git init rocmlir_src && cd rocmlir_src && \\
+    git remote add origin ${{ROCMLIR_REPO}} && \\
+    git fetch --depth 1 origin ${{ROCMLIR_COMMIT}} && \\
+    git checkout --detach FETCH_HEAD && \\
+    mkdir -p build && cd build && \\
+    cmake -G Ninja .. -DCMAKE_BUILD_TYPE=Release -DBUILD_FAT_LIBROCKCOMPILER=On -DLLVM_INCLUDE_TESTS=Off $CC_ARGS 2>&1 | tee /tmp/rocmlir_cmake.log && \\
+    ninja 2>&1 | tee /tmp/rocmlir_build.log && \\
+    cmake --install . --prefix /opt/rocmlir && \\
+    find /opt/rocmlir -name 'rocMLIRConfig.cmake' -o -name 'rocmlir-config.cmake' | tee /tmp/rocmlir_cmake_files.txt && \\
+    if [ ! -s /tmp/rocmlir_cmake_files.txt ]; then \\
+        echo "ERROR: rocMLIR CMake package config not found under /opt/rocmlir after install; find_package(rocMLIR) will fail in the MIGraphX build."; \\
+        exit 1; \\
+    fi && \\
+    cd / && rm -rf /workspace/rocmlir_src
+
+#
+# Build MIGraphX from source, reusing the prebuilt rocMLIR above.
+#
+# The ROCm/rocMLIR@<sha> line is stripped from requirements.txt so rbuild does
+# NOT rebuild LLVM/MLIR; MIGraphX's find_package(rocMLIR) is instead pointed at
+# the prebuilt /opt/rocmlir via rocMLIR_DIR (+ CMAKE_PREFIX_PATH).
 #
 ARG MIGRAPHX_REPO={}
 ARG MIGRAPHX_BRANCH={}
 ARG ONNXRUNTIME_VERSION
-ARG ONNXRUNTIME_REPO={}
-ARG ONNXRUNTIME_BRANCH={}
 ARG ONNXRUNTIME_BUILD_CONFIG
 
 RUN pip3 install --no-cache-dir wheel build && \\
     git clone ${{MIGRAPHX_REPO}} --recursive -b ${{MIGRAPHX_BRANCH}} migraphx_src && \\
     cd migraphx_src && \\
     pip3 install --no-cache-dir https://github.com/RadeonOpenCompute/rbuild/archive/master.tar.gz && \\
-    rbuild build -d depend -B build -DMIGRAPHX_ENABLE_PYTHON=OFF -DGPU_TARGETS=gfx942 2>&1 | tee migraphx_build.log && \\
+    EXPECTED_MLIR=$(grep -oiE 'rocMLIR@[0-9a-f]+' requirements.txt | head -1 | cut -d@ -f2) && \\
+    if [ -n "$EXPECTED_MLIR" ] && [ "$EXPECTED_MLIR" != "${{ROCMLIR_COMMIT}}" ]; then \\
+        echo "WARNING: prebuilt rocMLIR ${{ROCMLIR_COMMIT}} != MIGraphX requirements.txt pin $EXPECTED_MLIR; rebuild rocMLIR at the matching commit (set --rocmlir-commit) to avoid an ABI mismatch."; \\
+    fi && \\
+    sed -i '/rocMLIR/d' requirements.txt && \\
+    ROCMLIR_CFG=$(find /opt/rocmlir -name 'rocMLIRConfig.cmake' -o -name 'rocmlir-config.cmake' 2>/dev/null | head -1) && \\
+    if [ -z "$ROCMLIR_CFG" ]; then echo "ERROR: prebuilt rocMLIR not found under /opt/rocmlir; the rocMLIR build stage must run first."; exit 1; fi && \\
+    export CMAKE_PREFIX_PATH="/opt/rocmlir:${{CMAKE_PREFIX_PATH:-}}" && \\
+    rbuild build -d depend -B build -DMIGRAPHX_ENABLE_PYTHON=OFF -DGPU_TARGETS=gfx942 \\
+        -DMIGRAPHX_PACKAGE_BACKEND=default -DrocMLIR_DIR="$(dirname $ROCMLIR_CFG)" 2>&1 | tee migraphx_build.log && \\
     cd build && \\
-    make -j$(nproc) package && dpkg -i *.deb
+    make -j$(nproc) package && dpkg -i --force-depends *.deb && \\
+    find /opt/rocm -iname 'migraphx*config*.cmake' -o -iname 'migraphxConfig.cmake' | tee /tmp/migraphx_cmake_files.txt && \\
+    if [ ! -s /tmp/migraphx_cmake_files.txt ]; then \\
+        echo "ERROR: migraphx CMake package config not found under /opt/rocm after dpkg install; find_package(migraphx) will fail downstream."; \\
+        exit 1; \\
+    fi
+""".format(
+                FLAGS.rocmlir_repo,
+                FLAGS.rocmlir_commit,
+                FLAGS.migraphx_repo,
+                FLAGS.migraphx_branch,
+            )
 
+        # Shared by both MIGraphX provisioning modes: MLIR runtime env vars, the
+        # prebuilt ONNX Runtime core, and the out-of-tree MIGraphX plugin EP.
+        df += """
 ENV MIGRAPHX_MLIR_USE_SPECIFIC_OPS=attention,dot
 ENV MIGRAPHX_ENABLE_MLIR_GEG_FUSION=1
 ENV MIGRAPHX_ENABLE_REWRITE_DOT=1
 
 #
-# Build ONNX Runtime with MIGraphX EP from source
+# Fetch prebuilt ONNX Runtime core (EP-agnostic) from the upstream GitHub
+# release instead of building it from source. ONNX Runtime core does not need
+# ROCm: all MIGraphX support is provided out-of-tree by the plugin EP built
+# below, so the generic linux-x64 package is sufficient and avoids the long,
+# network-heavy ONNX Runtime source build.
 #
-RUN rm -rf onnxruntime && \\
-    git clone ${{ONNXRUNTIME_REPO}} --recursive -b ${{ONNXRUNTIME_BRANCH}} onnxruntime && \\
-    cd onnxruntime && \\
-    pip install numpy packaging && \\
-    ./build.sh --config ${{ONNXRUNTIME_BUILD_CONFIG}} --allow_running_as_root --rocm_home /opt/rocm --use_migraphx --migraphx_home /opt/rocm --skip_tests --parallel --enable_pybind --build_wheel 2>&1 | tee onnxrt_build.log && \\
-    pip install ./build/Linux/Release/dist/*.whl --force-reinstall && \\
-    cd build/Linux/Release && \\
-    cmake --install . --prefix /opt/rocm && \\
-    echo "ONNX Runtime installed to /opt/rocm with headers and libraries"
+# The upstream release tarball ships include/ + lib/ only (no CMake package
+# config), so we synthesize a minimal onnxruntimeConfig.cmake that exposes the
+# onnxruntime::onnxruntime imported target expected by the plugin's
+# find_package(onnxruntime) (src/CMakeLists.txt).
+#
+ARG ONNXRUNTIME_DIST=/opt/onnxruntime-dist
+RUN (command -v curl >/dev/null 2>&1 || (apt-get update && apt-get install -y --no-install-recommends curl ca-certificates)) && \\
+    mkdir -p ${{ONNXRUNTIME_DIST}} && \\
+    cd /tmp && \\
+    curl -fSL -o ort.tgz \\
+      https://github.com/microsoft/onnxruntime/releases/download/v${{ONNXRUNTIME_VERSION}}/onnxruntime-linux-x64-${{ONNXRUNTIME_VERSION}}.tgz && \\
+    tar -xzf ort.tgz --strip-components=1 -C ${{ONNXRUNTIME_DIST}} && \\
+    rm ort.tgz && \\
+    mkdir -p ${{ONNXRUNTIME_DIST}}/lib/cmake/onnxruntime && \\
+    printf '%s\\n' \\
+      'get_filename_component(_ort_root "${{CMAKE_CURRENT_LIST_DIR}}/../../.." ABSOLUTE)' \\
+      'add_library(onnxruntime::onnxruntime SHARED IMPORTED)' \\
+      'set_target_properties(onnxruntime::onnxruntime PROPERTIES' \\
+      '  IMPORTED_LOCATION "${{_ort_root}}/lib/libonnxruntime.so"' \\
+      '  INTERFACE_INCLUDE_DIRECTORIES "${{_ort_root}}/include")' \\
+      "set(onnxruntime_VERSION ${{ONNXRUNTIME_VERSION}})" \\
+      > ${{ONNXRUNTIME_DIST}}/lib/cmake/onnxruntime/onnxruntimeConfig.cmake && \\
+    echo "ONNX Runtime ${{ONNXRUNTIME_VERSION}} prebuilt core staged at ${{ONNXRUNTIME_DIST}}"
+
+#
+# Build the out-of-tree MIGraphX plugin EP (onnxruntime-ep-amdgpu ->
+# libmigraphx-ep.so), following the same steps as
+# onnxruntime-ep-amdgpu/scripts/build_migraphx_ep_standalone.sh (its step 3:
+# "Build onnxruntime-ep-amdgpu"). The plugin is built against the prebuilt ONNX
+# Runtime core staged at ${{ONNXRUNTIME_DIST}} (--onnxrt_home) and the MIGraphX
+# install under /opt/rocm (--migraphx_home, from the dpkg install above). The
+# resulting libmigraphx-ep.so is registered at runtime by the Triton backend via
+# RegisterExecutionProviderLibrary.
+#
+# Dependency setup mirrors the standalone script's step 0 (ninja,
+# packaging>=24.2, cmake==4.2.3, CXXFLAGS="-D__HIP_PLATFORM_AMD__=1 -w").
+# onnxruntime-ep-amdgpu/CMakeLists.txt requires CMake >= 4.2, which is newer than
+# the cmake shipped in the base image, so we install a compatible cmake via pip
+# for this build step only and point build.sh at it explicitly with --cmake_path,
+# leaving the image's system cmake untouched for every other build stage.
+#
+ARG MIGRAPHX_EP_REPO={}
+ARG MIGRAPHX_EP_BRANCH={}
+# Cache-bust token for just this EP stage. When Triton passes a new value
+# (--build-arg MIGRAPHX_EP_CACHE_BUST=...), Docker rebuilds only the EP below and
+# reuses the cached MIGraphX and prebuilt ONNX Runtime core layers above.
+ARG MIGRAPHX_EP_CACHE_BUST
+RUN echo "MIGraphX plugin EP cache-bust token: ${{MIGRAPHX_EP_CACHE_BUST}}" && \\
+    rm -rf onnxruntime-ep-amdgpu && \\
+    git clone ${{MIGRAPHX_EP_REPO}} --recursive -b ${{MIGRAPHX_EP_BRANCH}} onnxruntime-ep-amdgpu && \\
+    cd onnxruntime-ep-amdgpu && \\
+    git config --global --add safe.directory "*" && \\
+    pip3 install --no-cache-dir --upgrade ninja "packaging>=24.2" cmake==4.2.3 && \\
+    MGX_EP_CMAKE_BIN=$(python3 -c "import cmake, os; print(os.path.join(os.path.dirname(cmake.__file__), 'data', 'bin'))") && \\
+    export PATH="$MGX_EP_CMAKE_BIN:$PATH" && \\
+    export CXXFLAGS="-D__HIP_PLATFORM_AMD__=1 -w" && \\
+    ./build.sh --config ${{ONNXRUNTIME_BUILD_CONFIG}} \\
+        --cmake_generator Ninja \\
+        --cmake_path "$MGX_EP_CMAKE_BIN/cmake" \\
+        --onnxrt_home ${{ONNXRUNTIME_DIST}} \\
+        --use_migraphx \\
+        --migraphx_home /opt/rocm \\
+        --compile_no_warning_as_error \\
+        --parallel $(nproc) \\
+        --build_dir build.EP.MGX \\
+        --hip_path /opt/rocm 2>&1 | tee migraphx_ep_build.log; \\
+    if [ ! -f build.EP.MGX/${{ONNXRUNTIME_BUILD_CONFIG}}/src/migraphx/libmigraphx-ep.so ]; then \\
+        echo "ERROR: MIGraphX plugin EP build failed; libmigraphx-ep.so was not produced. See the build output / migraphx_ep_build.log above for the underlying error (e.g. an unrecognized build.sh flag, find_package(onnxruntime) not resolvable under ${{ONNXRUNTIME_DIST}}, or find_package(migraphx) not resolvable under /opt/rocm)."; \\
+        exit 1; \\
+    fi && \\
+    echo "MIGraphX plugin EP built at /workspace/onnxruntime-ep-amdgpu/build.EP.MGX/${{ONNXRUNTIME_BUILD_CONFIG}}/src/migraphx/libmigraphx-ep.so"
 """.format(
-            FLAGS.migraphx_repo,
-            FLAGS.migraphx_branch,
-            FLAGS.onnxruntime_repo,
-            FLAGS.onnxruntime_branch,
+            FLAGS.migraphx_ep_repo,
+            FLAGS.migraphx_ep_branch,
         )
     ## TEMPORARY: Using the tensorrt-8.0 branch until ORT 1.9 release to enable ORT backend with TRT 8.0 support.
     # For ORT versions 1.8.0 and below the behavior will remain same. For ORT version 1.8.1 we will
@@ -451,17 +608,25 @@ WORKDIR /workspace
 
 RUN mkdir -p /opt/onnxruntime/lib /opt/onnxruntime/include
 
-# Find and copy shared libraries from pip-installed onnxruntime
-# Note: Only MIGraphX EP is used, ROCm EP is skipped
-RUN SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])") && \\
-    echo "Found site-packages at: $SITE_PACKAGES" && \\
-    cp $SITE_PACKAGES/onnxruntime/capi/libonnxruntime.so.* /opt/onnxruntime/lib/ && \\
-    cp $SITE_PACKAGES/onnxruntime/capi/libonnxruntime_providers_shared.so /opt/onnxruntime/lib/ && \\
-    cp $SITE_PACKAGES/onnxruntime/capi/libonnxruntime_providers_migraphx.so /opt/onnxruntime/lib/ && \\
+# Copy the ONNX Runtime core shared libraries from the prebuilt dist.
+# Note: the built-in MIGraphX provider is no longer built; MIGraphX is provided
+# by the plugin EP (libmigraphx-ep.so) staged below. The prebuilt tarball may not
+# ship libonnxruntime_providers_shared.so, which is not required by the plugin EP
+# path, so that copy is best-effort.
+RUN cp -P /opt/onnxruntime-dist/lib/libonnxruntime.so* /opt/onnxruntime/lib/ && \\
     cd /opt/onnxruntime/lib && \\
-    ORT_SO=$(ls libonnxruntime.so.* | head -1) && \\
-    ln -sf $ORT_SO libonnxruntime.so.1 && \\
-    ln -sf $ORT_SO libonnxruntime.so
+    ORT_SO=$(basename "$(readlink -f libonnxruntime.so)") && \\
+    ln -sf "$ORT_SO" libonnxruntime.so.1 && \\
+    ln -sf "$ORT_SO" libonnxruntime.so && \\
+    (cp /opt/onnxruntime-dist/lib/libonnxruntime_providers_shared.so /opt/onnxruntime/lib/ 2>/dev/null || \\
+     echo "libonnxruntime_providers_shared.so not present in prebuilt dist (not required for plugin EP)")
+
+# Stage the MIGraphX plugin EP shared library. The Triton ONNX Runtime backend
+# registers this at runtime via RegisterExecutionProviderLibrary; the default
+# lookup path is /opt/tritonserver/backends/onnxruntime/libmigraphx-ep.so, which
+# is where the backend install places the contents of /opt/onnxruntime/lib.
+RUN cp /workspace/onnxruntime-ep-amdgpu/build.EP.MGX/${ONNXRUNTIME_BUILD_CONFIG}/src/migraphx/libmigraphx-ep.so /opt/onnxruntime/lib/ && \\
+    echo "MIGraphX plugin EP (libmigraphx-ep.so) staged to /opt/onnxruntime/lib"
 
 # Copy MIGraphX runtime libraries (built in this image via dpkg) into /opt/onnxruntime/lib
 # so they are included in final artifacts; the provider loads libmigraphx_c.so.3 at runtime.
@@ -469,15 +634,16 @@ RUN SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])") 
 RUN find /usr /opt/rocm /usr/local /workspace -name 'libmigraphx*.so*' 2>/dev/null | while read f; do cp -P "$f" /opt/onnxruntime/lib/; done && \\
     (ls /opt/onnxruntime/lib/libmigraphx*.so* 2>/dev/null && echo "MIGraphX runtime libs copied to /opt/onnxruntime/lib") || echo "No MIGraphX libs found under /usr, /opt/rocm, /usr/local, or /workspace"
 
-# Copy header files from installed ONNX Runtime
-# Headers are in /opt/rocm/include/onnxruntime/ (from cmake install)
-RUN echo "Copying header files from /opt/rocm/include/onnxruntime/" && \\
-    cp /opt/rocm/include/onnxruntime/onnxruntime_c_api.h /opt/onnxruntime/include/ && \\
-    cp /opt/rocm/include/onnxruntime/onnxruntime_session_options_config_keys.h /opt/onnxruntime/include/ && \\
-    cp /opt/rocm/include/onnxruntime/cpu_provider_factory.h /opt/onnxruntime/include/ && \\
-    (cp /opt/rocm/include/onnxruntime/onnxruntime_ep_c_api.h /opt/onnxruntime/include/ 2>/dev/null || echo "EP header not found, skipping") && \\
+# Copy the full ONNX Runtime header set from the prebuilt dist. ORT splits the C
+# API across several headers (e.g. onnxruntime_c_api.h -> onnxruntime_error_code.h,
+# onnxruntime_ep_c_api.h, onnxruntime_cxx_api.h, ...), so copy the whole include/
+# tree rather than a hand-picked subset to stay robust across versions. The
+# backend install excludes include/ from the final artifact, so this only affects
+# the compile step, not the packaged backend size.
+RUN echo "Copying ONNX Runtime headers from /opt/onnxruntime-dist/include/" && \\
+    cp -a /opt/onnxruntime-dist/include/. /opt/onnxruntime/include/ && \\
     echo "${ONNXRUNTIME_VERSION}" > /opt/onnxruntime/ort_onnx_version.txt && \\
-    echo "ONNX Runtime headers and libraries copied to /opt/onnxruntime"
+    echo "ONNX Runtime headers copied to /opt/onnxruntime/include"
 
 # Set RPATH for all .so files
 RUN cd /opt/onnxruntime/lib && \\
@@ -848,13 +1014,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--onnxruntime-repo",
         type=str,
-        default="https://github.com/ROCm/onnxruntime",
+        default="https://github.com/Microsoft/onnxruntime",
         help="ONNX Runtime (ROCm) git repo URL for build-from-source.",
     )
     parser.add_argument(
         "--onnxruntime-branch",
         type=str,
-        default="target_batch_compile",
+        default="v1.29.0",
         help="ONNX Runtime (ROCm) git branch for build-from-source.",
     )
     parser.add_argument(
@@ -866,8 +1032,62 @@ if __name__ == "__main__":
     parser.add_argument(
         "--migraphx-branch",
         type=str,
-        default="release/rocm-rel-7.2",
+        default="develop",
         help="MIGraphX git branch for build-from-source.",
+    )
+    parser.add_argument(
+        "--migraphx-build-mode",
+        type=str,
+        choices=["source", "package"],
+        default="source",
+        help="How to provision MIGraphX for the ROCm build. 'source' builds "
+        "--migraphx-branch from source, reusing a prebuilt rocMLIR (no LLVM "
+        "recompile). 'package' pulls the prebuilt amdrocm-migraphx packages and "
+        "skips the MIGraphX and rocMLIR source builds entirely.",
+    )
+    parser.add_argument(
+        "--migraphx-package-url",
+        type=str,
+        default="https://stable.repo.amd.com/rocm/migraphx/packages/debian12/pool/main",
+        help="Base URL of the prebuilt amdrocm-migraphx .deb pool "
+        "(used when --migraphx-build-mode=package).",
+    )
+    parser.add_argument(
+        "--migraphx-package-version",
+        type=str,
+        default="2.17.0+rocm10.0.0",
+        help="Version tag of the prebuilt amdrocm-migraphx packages (used when "
+        "--migraphx-build-mode=package). Must match the base image ROCm train "
+        "(e.g. 2.17.0 => rocm10.0.0) and Debian release (debian12).",
+    )
+    parser.add_argument(
+        "--rocmlir-repo",
+        type=str,
+        default="https://github.com/ROCm/rocMLIR.git",
+        help="rocMLIR git repo URL. rocMLIR (librockCompiler) is prebuilt once "
+        "into /opt/rocmlir and MIGraphX links it instead of rebuilding LLVM/MLIR "
+        "from source.",
+    )
+    parser.add_argument(
+        "--rocmlir-commit",
+        type=str,
+        default="2e1e7abf4ec789e74e49e42018f852ea66e5ef85",
+        help="rocMLIR git commit to prebuild. MUST match the ROCm/rocMLIR@<sha> "
+        "entry in MIGraphX's requirements.txt for ABI compatibility.",
+    )
+    parser.add_argument(
+        "--migraphx-ep-repo",
+        type=str,
+        default="https://github.com/onnxruntime/onnxruntime-ep-amdgpu.git",
+        help="MIGraphX plugin EP (onnxruntime-ep-amdgpu) git repo URL for "
+        "build-from-source.",
+    )
+    parser.add_argument(
+        "--migraphx-ep-branch",
+        type=str,
+        default="reduce_compute_io_overhead",
+        help="MIGraphX plugin EP (onnxruntime-ep-amdgpu) git branch for "
+        "build-from-source.",
     )
 
     FLAGS = parser.parse_args()
