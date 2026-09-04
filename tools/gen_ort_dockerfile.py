@@ -275,11 +275,83 @@ ENV PYTHONPATH=$INTEL_OPENVINO_DIR/python/python3.12:$INTEL_OPENVINO_DIR/python/
             openvino_toolkit_filename, openvino_folder_name
         )
 
-    # ROCm: Build MIGraphX and ONNX Runtime from source (NVIDIA-style, inside this image)
+    # ROCm: provision MIGraphX (either build the specified branch from source
+    # with a prebuilt rocMLIR, or pull prebuilt MIGraphX packages), then fetch
+    # the prebuilt ONNX Runtime core and build the out-of-tree plugin EP.
     if FLAGS.enable_rocm:
-        df += """
+        if FLAGS.migraphx_build_mode == "package":
+            df += """
 #
-# Build MIGraphX from source
+# Provision MIGraphX from prebuilt packages (no MIGraphX/rocMLIR source build).
+#
+# Pulls amdrocm-migraphx (runtime libs) and amdrocm-migraphx-dev (headers +
+# migraphxConfig.cmake). The prebuilt library already has rocMLIR statically
+# linked, so there is NO LLVM/MLIR compile and NO MIGraphX source build -- only
+# a package download + install. MIGRAPHX_PACKAGE_VERSION must match the base
+# image ROCm train (e.g. 2.17.0 => rocm10.0.0) and Debian release (debian12).
+#
+ARG MIGRAPHX_PACKAGE_URL={}
+ARG MIGRAPHX_PACKAGE_VERSION={}
+ARG ONNXRUNTIME_VERSION
+ARG ONNXRUNTIME_BUILD_CONFIG
+
+RUN (command -v curl >/dev/null 2>&1 || (apt-get update && apt-get install -y --no-install-recommends curl ca-certificates)) && \\
+    cd /tmp && \\
+    MIGRAPHX_PACKAGE_VERSION_URL="$(printf '%s' "${{MIGRAPHX_PACKAGE_VERSION}}" | sed 's/+/%2B/g')" && \\
+    curl -fSL -o amdrocm-migraphx_${{MIGRAPHX_PACKAGE_VERSION}}_amd64.deb ${{MIGRAPHX_PACKAGE_URL}}/amdrocm-migraphx_${{MIGRAPHX_PACKAGE_VERSION_URL}}_amd64.deb && \\
+    curl -fSL -o amdrocm-migraphx-dev_${{MIGRAPHX_PACKAGE_VERSION}}_amd64.deb ${{MIGRAPHX_PACKAGE_URL}}/amdrocm-migraphx-dev_${{MIGRAPHX_PACKAGE_VERSION_URL}}_amd64.deb && \\
+    (dpkg -i --force-depends /tmp/amdrocm-migraphx_${{MIGRAPHX_PACKAGE_VERSION}}_amd64.deb /tmp/amdrocm-migraphx-dev_${{MIGRAPHX_PACKAGE_VERSION}}_amd64.deb || (apt-get update && apt-get install -f -y)) && \\
+    rm -f /tmp/amdrocm-migraphx*.deb && \\
+    find /opt/rocm -iname 'migraphx*config*.cmake' -o -iname 'migraphxConfig.cmake' | tee /tmp/migraphx_cmake_files.txt && \\
+    if [ ! -s /tmp/migraphx_cmake_files.txt ]; then \\
+        echo "ERROR: migraphx CMake package config not found under /opt/rocm after installing prebuilt packages; find_package(migraphx) will fail downstream. Verify --migraphx-package-version matches the base ROCm train and Debian release (e.g. 2.17.0+rocm10.0.0 for debian12)."; \\
+        exit 1; \\
+    fi
+""".format(
+                FLAGS.migraphx_package_url,
+                FLAGS.migraphx_package_version,
+            )
+        else:
+            df += """
+#
+# Build rocMLIR (librockCompiler) ONCE from a pinned commit into /opt/rocmlir.
+#
+# This is the expensive LLVM/MLIR compile. MIGraphX consumes rocMLIR as the
+# static rocMLIR::rockCompiler library (find_package(rocMLIR) in
+# src/targets/gpu/CMakeLists.txt), so building it here as its own Docker layer --
+# keyed only by ROCMLIR_REPO/ROCMLIR_COMMIT -- decouples the LLVM/MLIR build from
+# the (frequently-changing) MIGraphX and plugin-EP source: changing
+# MIGRAPHX_BRANCH or the EP no longer triggers an LLVM rebuild. ROCMLIR_COMMIT
+# MUST match the ROCm/rocMLIR@<sha> pin in MIGraphX's requirements.txt for ABI
+# compatibility; bump it to force a rocMLIR rebuild.
+#
+ARG ROCMLIR_REPO={}
+ARG ROCMLIR_COMMIT={}
+RUN pip3 install --no-cache-dir ninja && \\
+    ROCM_CLANGXX=""; for c in /opt/rocm/llvm/bin/clang++ /opt/rocm/lib/llvm/bin/clang++; do if [ -x "$c" ]; then ROCM_CLANGXX="$c"; break; fi; done && \\
+    CC_ARGS=""; if [ -n "$ROCM_CLANGXX" ]; then CC_ARGS="-DCMAKE_CXX_COMPILER=$ROCM_CLANGXX -DCMAKE_C_COMPILER=${{ROCM_CLANGXX%++}}"; fi && \\
+    echo "Building rocMLIR ${{ROCMLIR_COMMIT}} (C++ compiler: ${{ROCM_CLANGXX:-<system default>}})" && \\
+    git init rocmlir_src && cd rocmlir_src && \\
+    git remote add origin ${{ROCMLIR_REPO}} && \\
+    git fetch --depth 1 origin ${{ROCMLIR_COMMIT}} && \\
+    git checkout --detach FETCH_HEAD && \\
+    mkdir -p build && cd build && \\
+    cmake -G Ninja .. -DCMAKE_BUILD_TYPE=Release -DBUILD_FAT_LIBROCKCOMPILER=On -DLLVM_INCLUDE_TESTS=Off $CC_ARGS 2>&1 | tee /tmp/rocmlir_cmake.log && \\
+    ninja 2>&1 | tee /tmp/rocmlir_build.log && \\
+    cmake --install . --prefix /opt/rocmlir && \\
+    find /opt/rocmlir -name 'rocMLIRConfig.cmake' -o -name 'rocmlir-config.cmake' | tee /tmp/rocmlir_cmake_files.txt && \\
+    if [ ! -s /tmp/rocmlir_cmake_files.txt ]; then \\
+        echo "ERROR: rocMLIR CMake package config not found under /opt/rocmlir after install; find_package(rocMLIR) will fail in the MIGraphX build."; \\
+        exit 1; \\
+    fi && \\
+    cd / && rm -rf /workspace/rocmlir_src
+
+#
+# Build MIGraphX from source, reusing the prebuilt rocMLIR above.
+#
+# The ROCm/rocMLIR@<sha> line is stripped from requirements.txt so rbuild does
+# NOT rebuild LLVM/MLIR; MIGraphX's find_package(rocMLIR) is instead pointed at
+# the prebuilt /opt/rocmlir via rocMLIR_DIR (+ CMAKE_PREFIX_PATH).
 #
 ARG MIGRAPHX_REPO={}
 ARG MIGRAPHX_BRANCH={}
@@ -290,10 +362,33 @@ RUN pip3 install --no-cache-dir wheel build && \\
     git clone ${{MIGRAPHX_REPO}} --recursive -b ${{MIGRAPHX_BRANCH}} migraphx_src && \\
     cd migraphx_src && \\
     pip3 install --no-cache-dir https://github.com/RadeonOpenCompute/rbuild/archive/master.tar.gz && \\
-    rbuild build -d depend -B build -DMIGRAPHX_ENABLE_PYTHON=OFF -DGPU_TARGETS=gfx942 2>&1 | tee migraphx_build.log && \\
+    EXPECTED_MLIR=$(grep -oiE 'rocMLIR@[0-9a-f]+' requirements.txt | head -1 | cut -d@ -f2) && \\
+    if [ -n "$EXPECTED_MLIR" ] && [ "$EXPECTED_MLIR" != "${{ROCMLIR_COMMIT}}" ]; then \\
+        echo "WARNING: prebuilt rocMLIR ${{ROCMLIR_COMMIT}} != MIGraphX requirements.txt pin $EXPECTED_MLIR; rebuild rocMLIR at the matching commit (set --rocmlir-commit) to avoid an ABI mismatch."; \\
+    fi && \\
+    sed -i '/rocMLIR/d' requirements.txt && \\
+    ROCMLIR_CFG=$(find /opt/rocmlir -name 'rocMLIRConfig.cmake' -o -name 'rocmlir-config.cmake' 2>/dev/null | head -1) && \\
+    if [ -z "$ROCMLIR_CFG" ]; then echo "ERROR: prebuilt rocMLIR not found under /opt/rocmlir; the rocMLIR build stage must run first."; exit 1; fi && \\
+    export CMAKE_PREFIX_PATH="/opt/rocmlir:${{CMAKE_PREFIX_PATH:-}}" && \\
+    rbuild build -d depend -B build -DMIGRAPHX_ENABLE_PYTHON=OFF -DGPU_TARGETS=gfx942 \\
+        -DMIGRAPHX_PACKAGE_BACKEND=default -DrocMLIR_DIR="$(dirname $ROCMLIR_CFG)" 2>&1 | tee migraphx_build.log && \\
     cd build && \\
-    make -j$(nproc) package && dpkg -i *.deb
+    make -j$(nproc) package && dpkg -i --force-depends *.deb && \\
+    find /opt/rocm -iname 'migraphx*config*.cmake' -o -iname 'migraphxConfig.cmake' | tee /tmp/migraphx_cmake_files.txt && \\
+    if [ ! -s /tmp/migraphx_cmake_files.txt ]; then \\
+        echo "ERROR: migraphx CMake package config not found under /opt/rocm after dpkg install; find_package(migraphx) will fail downstream."; \\
+        exit 1; \\
+    fi
+""".format(
+                FLAGS.rocmlir_repo,
+                FLAGS.rocmlir_commit,
+                FLAGS.migraphx_repo,
+                FLAGS.migraphx_branch,
+            )
 
+        # Shared by both MIGraphX provisioning modes: MLIR runtime env vars, the
+        # prebuilt ONNX Runtime core, and the out-of-tree MIGraphX plugin EP.
+        df += """
 ENV MIGRAPHX_MLIR_USE_SPECIFIC_OPS=attention,dot
 ENV MIGRAPHX_ENABLE_MLIR_GEG_FUSION=1
 ENV MIGRAPHX_ENABLE_REWRITE_DOT=1
@@ -348,7 +443,12 @@ RUN (command -v curl >/dev/null 2>&1 || (apt-get update && apt-get install -y --
 #
 ARG MIGRAPHX_EP_REPO={}
 ARG MIGRAPHX_EP_BRANCH={}
-RUN rm -rf onnxruntime-ep-amdgpu && \\
+# Cache-bust token for just this EP stage. When Triton passes a new value
+# (--build-arg MIGRAPHX_EP_CACHE_BUST=...), Docker rebuilds only the EP below and
+# reuses the cached MIGraphX and prebuilt ONNX Runtime core layers above.
+ARG MIGRAPHX_EP_CACHE_BUST
+RUN echo "MIGraphX plugin EP cache-bust token: ${{MIGRAPHX_EP_CACHE_BUST}}" && \\
+    rm -rf onnxruntime-ep-amdgpu && \\
     git clone ${{MIGRAPHX_EP_REPO}} --recursive -b ${{MIGRAPHX_EP_BRANCH}} onnxruntime-ep-amdgpu && \\
     cd onnxruntime-ep-amdgpu && \\
     git config --global --add safe.directory "*" && \\
@@ -365,16 +465,13 @@ RUN rm -rf onnxruntime-ep-amdgpu && \\
         --compile_no_warning_as_error \\
         --parallel $(nproc) \\
         --build_dir build.EP.MGX \\
-        --hip_path /opt/rocm \\
-        --build_wheel 2>&1 | tee migraphx_ep_build.log; \\
+        --hip_path /opt/rocm 2>&1 | tee migraphx_ep_build.log; \\
     if [ ! -f build.EP.MGX/${{ONNXRUNTIME_BUILD_CONFIG}}/src/migraphx/libmigraphx-ep.so ]; then \\
         echo "ERROR: MIGraphX plugin EP build failed; libmigraphx-ep.so was not produced. See the build output / migraphx_ep_build.log above for the underlying error (e.g. an unrecognized build.sh flag, find_package(onnxruntime) not resolvable under ${{ONNXRUNTIME_DIST}}, or find_package(migraphx) not resolvable under /opt/rocm)."; \\
         exit 1; \\
     fi && \\
     echo "MIGraphX plugin EP built at /workspace/onnxruntime-ep-amdgpu/build.EP.MGX/${{ONNXRUNTIME_BUILD_CONFIG}}/src/migraphx/libmigraphx-ep.so"
 """.format(
-            FLAGS.migraphx_repo,
-            FLAGS.migraphx_branch,
             FLAGS.migraphx_ep_repo,
             FLAGS.migraphx_ep_branch,
         )
@@ -937,6 +1034,46 @@ if __name__ == "__main__":
         type=str,
         default="develop",
         help="MIGraphX git branch for build-from-source.",
+    )
+    parser.add_argument(
+        "--migraphx-build-mode",
+        type=str,
+        choices=["source", "package"],
+        default="source",
+        help="How to provision MIGraphX for the ROCm build. 'source' builds "
+        "--migraphx-branch from source, reusing a prebuilt rocMLIR (no LLVM "
+        "recompile). 'package' pulls the prebuilt amdrocm-migraphx packages and "
+        "skips the MIGraphX and rocMLIR source builds entirely.",
+    )
+    parser.add_argument(
+        "--migraphx-package-url",
+        type=str,
+        default="https://stable.repo.amd.com/rocm/migraphx/packages/debian12/pool/main",
+        help="Base URL of the prebuilt amdrocm-migraphx .deb pool "
+        "(used when --migraphx-build-mode=package).",
+    )
+    parser.add_argument(
+        "--migraphx-package-version",
+        type=str,
+        default="2.17.0+rocm10.0.0",
+        help="Version tag of the prebuilt amdrocm-migraphx packages (used when "
+        "--migraphx-build-mode=package). Must match the base image ROCm train "
+        "(e.g. 2.17.0 => rocm10.0.0) and Debian release (debian12).",
+    )
+    parser.add_argument(
+        "--rocmlir-repo",
+        type=str,
+        default="https://github.com/ROCm/rocMLIR.git",
+        help="rocMLIR git repo URL. rocMLIR (librockCompiler) is prebuilt once "
+        "into /opt/rocmlir and MIGraphX links it instead of rebuilding LLVM/MLIR "
+        "from source.",
+    )
+    parser.add_argument(
+        "--rocmlir-commit",
+        type=str,
+        default="2e1e7abf4ec789e74e49e42018f852ea66e5ef85",
+        help="rocMLIR git commit to prebuild. MUST match the ROCm/rocMLIR@<sha> "
+        "entry in MIGraphX's requirements.txt for ABI compatibility.",
     )
     parser.add_argument(
         "--migraphx-ep-repo",
